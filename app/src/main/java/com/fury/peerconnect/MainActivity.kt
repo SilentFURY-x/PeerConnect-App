@@ -27,6 +27,8 @@ class MainActivity : AppCompatActivity() {
     private var isDiscovering = false
     private var myNickName: String = ""
 
+    private var connectedEndpointId: String? = null // Who are we connected to?
+
     // UI Elements
     private lateinit var statusText: TextView
     private lateinit var btnHost: Button
@@ -237,6 +239,7 @@ class MainActivity : AppCompatActivity() {
                     statusText.text = "Status: CONNECTED to $endpointId"
                     Toast.makeText(this@MainActivity, "Connected!", Toast.LENGTH_SHORT).show()
 
+                    connectedEndpointId = endpointId
                     // Double check they are stopped (Safety)
                     Nearby.getConnectionsClient(this@MainActivity).stopAdvertising()
                     Nearby.getConnectionsClient(this@MainActivity).stopDiscovery()
@@ -251,7 +254,7 @@ class MainActivity : AppCompatActivity() {
         override fun onDisconnected(endpointId: String) {
             statusText.text = "Status: Disconnected"
 
-            // --- CHANGE 2: UNCOMMENT THIS ---
+            connectedEndpointId = null // Clear it
             // This ensures that if the other person leaves, my phone
             // automatically resets so I can switch roles immediately.
             resetRadio()
@@ -261,11 +264,21 @@ class MainActivity : AppCompatActivity() {
     // --- 4. DATA HANDLING (We will use this in Phase 3) ---
     private val payloadCallback = object : PayloadCallback() {
         override fun onPayloadReceived(endpointId: String, payload: Payload) {
-            // TODO: Receive messages here
+            // We received data!
+            if (payload.type == Payload.Type.BYTES) {
+                // 1. Get the bytes
+                val receivedBytes = payload.asBytes()!!
+
+                // 2. Unpack (Deserialize) back into a ChatMessage object
+                val receivedMessage = deserialize(receivedBytes)
+
+                // 3. Show it on the screen
+                statusText.append("\n${receivedMessage.senderId}: ${receivedMessage.message}")
+            }
         }
 
         override fun onPayloadTransferUpdate(endpointId: String, update: PayloadTransferUpdate) {
-            // Bytes transferred progress
+            // This is for progress bars (file transfer). We don't need it for text.
         }
     }
 
@@ -334,5 +347,47 @@ class MainActivity : AppCompatActivity() {
             // THIS is what makes the buttons work:
             onFinished()
         }, 1500)
+    }
+
+    // --- HELPER 1: SERIALIZATION (Object -> Bytes) ---
+    // Takes a ChatMessage and turns it into a ByteArray so we can send it.
+    private fun serialize(message: ChatMessage): ByteArray {
+        val outputStream = java.io.ByteArrayOutputStream()
+        val objectStream = java.io.ObjectOutputStream(outputStream)
+        objectStream.writeObject(message)
+        return outputStream.toByteArray()
+    }
+
+    // --- HELPER 2: DESERIALIZATION (Bytes -> Object) ---
+    // Takes the received ByteArray and rebuilds the ChatMessage object.
+    private fun deserialize(bytes: ByteArray): ChatMessage {
+        val inputStream = java.io.ByteArrayInputStream(bytes)
+        val objectStream = java.io.ObjectInputStream(inputStream)
+        return objectStream.readObject() as ChatMessage
+    }
+
+    private fun sendMessage(messageText: String) {
+        // 1. Check if we are connected
+        if (connectedEndpointId == null) {
+            Toast.makeText(this, "Not connected to anyone!", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        // 2. Create the Message Object
+        val chatMessage = ChatMessage(
+            senderId = myNickName,
+            message = messageText,
+            timestamp = System.currentTimeMillis()
+        )
+
+        // 3. Pack it (Serialize)
+        val bytes = serialize(chatMessage)
+
+        // 4. Send it!
+        // Payload.fromBytes() wraps our byte array into a Google Nearby Payload
+        Nearby.getConnectionsClient(this).sendPayload(connectedEndpointId!!, Payload.fromBytes(bytes))
+
+        // 5. Update my own UI (so I can see what I sent)
+        statusText.append("\nMe: $messageText")
     }
 }
