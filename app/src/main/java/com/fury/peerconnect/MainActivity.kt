@@ -44,6 +44,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var editMessage: EditText
     private lateinit var btnSend: Button
 
+    // Peer List UI
+    private lateinit var peersRecyclerView: RecyclerView
+    private lateinit var peerAdapter: PeerAdapter
+
     // Adapter
     private lateinit var chatAdapter: ChatAdapter
 
@@ -96,6 +100,32 @@ class MainActivity : AppCompatActivity() {
         chatRecyclerView = findViewById(R.id.chatRecyclerView)
         editMessage = findViewById(R.id.editMessage)
         btnSend = findViewById(R.id.btnSend)
+
+        // --- INITIALIZE PEER LIST VIEWS ---
+        peersRecyclerView = findViewById(R.id.peersRecyclerView)
+        peersRecyclerView.layoutManager = LinearLayoutManager(this)
+
+        // --- SETUP PEER ADAPTER (Click Logic) ---
+        peerAdapter = PeerAdapter { endpointId, endpointName ->
+            // This code runs when you CLICK a user in the list
+
+            // 1. Stop scanning (we found who we want)
+            Nearby.getConnectionsClient(this).stopDiscovery()
+
+            // 2. Update status
+            statusText.text = "Connecting to $endpointName..."
+
+            // 3. Request Connection manually
+            Nearby.getConnectionsClient(this)
+                .requestConnection(myNickName, endpointId, connectionLifecycleCallback)
+                .addOnFailureListener {
+                    statusText.text = "Connection Failed"
+                    // Optional: Restart discovery if it failed
+                    startDiscovery()
+                }
+        }
+
+        peersRecyclerView.adapter = peerAdapter
 
         // Setup RecyclerView
         chatRecyclerView.layoutManager = LinearLayoutManager(this)
@@ -186,15 +216,22 @@ class MainActivity : AppCompatActivity() {
 
     private val endpointDiscoveryCallback = object : EndpointDiscoveryCallback() {
         override fun onEndpointFound(endpointId: String, info: DiscoveredEndpointInfo) {
-            isDiscovering = false
-            handler.removeCallbacksAndMessages(null)
-            statusText.text = "Found: ${info.endpointName}. Connecting..."
+            // 1. Log it
+            Log.d(TAG, "Found: ${info.endpointName}")
 
-            Nearby.getConnectionsClient(this@MainActivity)
-                .requestConnection(myNickName, endpointId, connectionLifecycleCallback)
-                .addOnFailureListener { startDiscovery() }
+            // 2. Update status to tell user what to do
+            statusText.text = "Found peers! Select one below."
+
+            // 3. ADD TO ADAPTER (Safety Check Included)
+            // We do NOT stop discovery here. We keep listening for more peers.
+            if (::peerAdapter.isInitialized) {
+                peerAdapter.addPeer(endpointId, info)
+            }
         }
-        override fun onEndpointLost(endpointId: String) {}
+
+        override fun onEndpointLost(endpointId: String) {
+            // Optional: Remove them from the list if they walk away
+        }
     }
 
     private val connectionLifecycleCallback = object : ConnectionLifecycleCallback() {
@@ -266,6 +303,12 @@ class MainActivity : AppCompatActivity() {
         Nearby.getConnectionsClient(this).stopAllEndpoints()
         Nearby.getConnectionsClient(this).stopAdvertising()
         Nearby.getConnectionsClient(this).stopDiscovery()
+
+        // --- CLEAR PEER LIST ---
+        // We check 'isInitialized' to avoid crashes if the app just started
+        if (::peerAdapter.isInitialized) {
+            peerAdapter.clearPeers()
+        }
 
         statusText.text = "Status: Resetting..."
         val randomNum = (1000..9999).random()
