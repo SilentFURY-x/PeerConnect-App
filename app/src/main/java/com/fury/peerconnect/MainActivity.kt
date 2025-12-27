@@ -107,21 +107,22 @@ class MainActivity : AppCompatActivity() {
 
         // --- SETUP PEER ADAPTER (Click Logic) ---
         peerAdapter = PeerAdapter { endpointId, endpointName ->
-            // This code runs when you CLICK a user in the list
+            // 1. CRITICAL FIX: Kill the Pulse Timer immediately!
+            isDiscovering = false
+            handler.removeCallbacksAndMessages(null)
 
-            // 1. Stop scanning (we found who we want)
+            // 2. Stop scanning (we found who we want)
             Nearby.getConnectionsClient(this).stopDiscovery()
 
-            // 2. Update status
+            // 3. Update status
             statusText.text = "Connecting to $endpointName..."
 
-            // 3. Request Connection manually
+            // 4. Request Connection manually
             Nearby.getConnectionsClient(this)
                 .requestConnection(myNickName, endpointId, connectionLifecycleCallback)
                 .addOnFailureListener {
                     statusText.text = "Connection Failed"
-                    // Optional: Restart discovery if it failed
-                    startDiscovery()
+                    // If connection fails, user can press Join again manually
                 }
         }
 
@@ -201,13 +202,15 @@ class MainActivity : AppCompatActivity() {
             .addOnSuccessListener {
                 statusText.text = "Status: Scanning ($myNickName)..."
 
-                // Pulse Logic
+                // Pulse Logic (Increased to 10 seconds for stability)
                 handler.postDelayed({
+                    // CRITICAL CHECK: Only restart if we are STILL discovering.
+                    // If the user clicked a name, isDiscovering will be false, and this won't run.
                     if (isDiscovering) {
                         Nearby.getConnectionsClient(this@MainActivity).stopDiscovery()
                         startDiscovery()
                     }
-                }, 6000)
+                }, 10000) // Changed from 6000 to 10000
             }
             .addOnFailureListener {
                 statusText.text = "Status: Discovery Failed"
