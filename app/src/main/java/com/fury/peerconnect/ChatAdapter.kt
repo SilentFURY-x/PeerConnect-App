@@ -14,6 +14,24 @@ class ChatAdapter(
     private val TYPE_ME = 1
     private val TYPE_OTHER = 2
 
+    // --- NEW HELPER FUNCTIONS FOR DATABASE ---
+
+    // 1. Clear List (Used before reloading history)
+    fun clear() {
+        val size = messages.size
+        messages.clear()
+        notifyItemRangeRemoved(0, size)
+    }
+
+    // 2. Set Full List (Used to display loaded history)
+    fun setMessages(history: List<ChatMessage>) {
+        messages.clear()
+        messages.addAll(history)
+        notifyDataSetChanged()
+    }
+
+    // -----------------------------------------
+
     fun addMessage(msg: ChatMessage) {
         messages.add(msg)
         notifyItemInserted(messages.size - 1)
@@ -21,7 +39,7 @@ class ChatAdapter(
 
     override fun getItemViewType(position: Int): Int {
         val message = messages[position]
-        // FIX: Used senderName to match ChatMessage.kt
+        // Using your variable: senderName
         return if (message.senderName == myNickName) TYPE_ME else TYPE_OTHER
     }
 
@@ -45,8 +63,10 @@ class ChatAdapter(
         private val textMessage: TextView = itemView.findViewById(R.id.textMessage)
         private val textSender: TextView = itemView.findViewById(R.id.textSender)
 
+        // Note: If you added a timestamp TextView to your XML, initialize it here.
+
         fun bind(msg: ChatMessage) {
-            // FIX: Used proper property names
+            // Using your variables: messageBody and senderName
             textMessage.text = msg.messageBody
             textSender.text = msg.senderName
         }

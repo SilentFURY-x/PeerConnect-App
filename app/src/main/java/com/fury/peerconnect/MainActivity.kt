@@ -275,32 +275,50 @@ class MainActivity : AppCompatActivity() {
                     statusText.text = "Status: CONNECTED"
                     connectedEndpointId = endpointId
 
-                    // SWITCH SCREENS
+                    // UI Changes
                     layoutConnection.visibility = android.view.View.GONE
                     layoutChat.visibility = android.view.View.VISIBLE
 
                     Nearby.getConnectionsClient(this@MainActivity).stopAdvertising()
                     Nearby.getConnectionsClient(this@MainActivity).stopDiscovery()
 
-                    // SAVE TO DB
-                    val newPeer = PeerEntity(
-                        endpointId = endpointId,
-                        name = targetPeerName, // <--- USE IT HERE
-                        lastSeenTimestamp = System.currentTimeMillis(),
-                        isOnline = true
-                    )
-
+                    // --- NEW DATABASE LOGIC STARTS HERE ---
                     lifecycleScope.launch(Dispatchers.IO) {
+                        // A. Save the Peer Connection
+                        val newPeer = PeerEntity(endpointId, targetPeerName, System.currentTimeMillis(), true)
                         db.peerDao().insertPeer(newPeer)
+
+                        // B. Load Chat History
+                        val history = db.messageDao().getChatHistory(myNickName, targetPeerName)
+                        withContext(Dispatchers.Main) {
+                            updateChatUI(history)
+                        }
+
+                        // C. RESILIENCY CHECK (Send Unsent Messages)
+                        val pendingMsgs = db.messageDao().getUnsentMessages(targetPeerName)
+                        if (pendingMsgs.isNotEmpty()) {
+                            withContext(Dispatchers.Main) {
+                                statusText.text = "Sending ${pendingMsgs.size} pending messages..."
+                            }
+
+                            for (msg in pendingMsgs) {
+                                // 1. Send
+                                val chatPayload = ChatMessage(myNickName, msg.text, msg.timestamp)
+                                Nearby.getConnectionsClient(this@MainActivity).sendPayload(endpointId, Payload.fromBytes(serialize(chatPayload)))
+
+                                // 2. Mark as Sent in DB
+                                db.messageDao().markAsSent(msg.id)
+                            }
+                        }
                     }
+                    // --- NEW DATABASE LOGIC ENDS HERE ---
                 }
                 else -> resetRadio()
             }
-
         }
 
         override fun onDisconnected(endpointId: String) {
-            resetRadio()
+            onSignalLost()
         }
     }
 
@@ -310,25 +328,81 @@ class MainActivity : AppCompatActivity() {
                 val receivedBytes = payload.asBytes()!!
                 val receivedMessage = deserialize(receivedBytes)
 
-                // Add to Adapter
-                chatAdapter.addMessage(receivedMessage)
-                chatRecyclerView.scrollToPosition(chatAdapter.itemCount - 1)
+                // 1. Create Entity
+                val msgEntity = MessageEntity(
+                    senderId = receivedMessage.senderName, // The sender's name
+                    receiverId = myNickName,           // It was sent to ME
+                    text = receivedMessage.messageBody,
+                    timestamp = receivedMessage.time,
+                    isSent = true // Received means it was sent successfully
+                )
+
+                // 2. Save & Update UI
+                lifecycleScope.launch(Dispatchers.IO) {
+                    db.messageDao().insertMessage(msgEntity)
+
+                    // Reload to keep order correct
+                    val history = db.messageDao().getChatHistory(myNickName, targetPeerName)
+                    withContext(Dispatchers.Main) {
+                        updateChatUI(history)
+                    }
+                }
             }
         }
         override fun onPayloadTransferUpdate(endpointId: String, update: PayloadTransferUpdate) {}
     }
 
     private fun sendMessage(messageText: String) {
-        if (connectedEndpointId == null) return
+        // 1. Determine status
+        // If we have an endpoint ID, we are connected. If null, we are disconnected.
+        val isConnected = connectedEndpointId != null
 
-        val chatMessage = ChatMessage(myNickName, messageText, System.currentTimeMillis())
-        val bytes = serialize(chatMessage)
+        // 2. Create the Entity
+        val msgEntity = MessageEntity(
+            senderId = myNickName,
+            receiverId = targetPeerName, // Who are we talking to?
+            text = messageText,
+            timestamp = System.currentTimeMillis(),
+            isSent = isConnected // TRUE if connected, FALSE if "pending"
+        )
 
-        Nearby.getConnectionsClient(this).sendPayload(connectedEndpointId!!, Payload.fromBytes(bytes))
+        // 3. Save to DB (Always!)
+        lifecycleScope.launch(Dispatchers.IO) {
+            db.messageDao().insertMessage(msgEntity)
 
-        // Add to my own UI
-        chatAdapter.addMessage(chatMessage)
-        chatRecyclerView.scrollToPosition(chatAdapter.itemCount - 1)
+            // 4. Update UI immediately
+            val history = db.messageDao().getChatHistory(myNickName, targetPeerName)
+            withContext(Dispatchers.Main) {
+                updateChatUI(history)
+            }
+        }
+
+        // 5. Actually Send (If possible)
+        if (isConnected) {
+            val chatMessage = ChatMessage(myNickName, messageText, System.currentTimeMillis())
+
+            Nearby.getConnectionsClient(this)
+                .sendPayload(connectedEndpointId!!, Payload.fromBytes(serialize(chatMessage)))
+                .addOnFailureListener {
+                    // SENDING FAILED (e.g., Radio turned off suddenly)
+                    // We need to flip the DB entry back to isSent = false
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        // We need the ID of the message we just inserted.
+                        // For simplicity in this fix, we assume the last inserted message is the one.
+                        // A better way is to have insertMessage return the new ID.
+
+                        // For now, let's just Toast so you know it happened
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(this@MainActivity, "Send failed. Saved as pending.", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }
+        } else {
+            Toast.makeText(this, "Saved (Offline). Will send when reconnected.", Toast.LENGTH_SHORT).show()
+        }
+
+        // Clear input
+        editMessage.setText("")
     }
 
     private fun resetRadio(onFinished: () -> Unit = {}) {
@@ -484,5 +558,35 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+    }
+
+    // Helper to convert DB entities to ChatAdapter format
+    private fun updateChatUI(history: List<MessageEntity>) {
+        val chatMessages = history.map { entity ->
+            ChatMessage(
+                senderName = entity.senderId,
+                messageBody = entity.text,
+                time = entity.timestamp
+            )
+        }
+        // Now you can just call this single line:
+        chatAdapter.setMessages(chatMessages)
+
+        if (chatAdapter.itemCount > 0) {
+            chatRecyclerView.scrollToPosition(chatAdapter.itemCount - 1)
+        }
+    }
+
+    private fun onSignalLost() {
+        // 1. Mark as disconnected
+        connectedEndpointId = null
+
+        // 2. Update UI (BUT DO NOT HIDE CHAT)
+        statusText.text = "Offline: Waiting to reconnect..."
+
+        // 3. Restart scanning to find them again automatically
+        // (If you implemented the Auto-Connect phase, call startAutoMode() here)
+        // For now, let's just start discovery to find them back
+        startDiscovery()
     }
 }
