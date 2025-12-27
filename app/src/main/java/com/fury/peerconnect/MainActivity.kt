@@ -13,12 +13,21 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.constraintlayout.widget.ConstraintLayout
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.gms.nearby.Nearby
 import com.google.android.gms.nearby.connection.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.launch
 
 class MainActivity : AppCompatActivity() {
+
+    private var targetPeerName: String = "" // Add this
+
+    // Database
+    private lateinit var db: AppDatabase
 
     // Unique ID for our app (The "Radio Channel")
     private val SERVICE_ID = "com.fury.peerconnect_v2"
@@ -88,6 +97,14 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        db = AppDatabase.getDatabase(this)
+
+// Reset everyone to "Offline" when app opens
+        lifecycleScope.launch(Dispatchers.IO) {
+            db.peerDao().setAllOffline()
+            loadPeersFromDb() // Show the history immediately
+        }
+
         // 1. INITIALIZE ALL VIEWS (This prevents the crash!)
         statusText = findViewById(R.id.statusText)
         btnHost = findViewById(R.id.btnHost)
@@ -107,6 +124,9 @@ class MainActivity : AppCompatActivity() {
 
         // --- SETUP PEER ADAPTER (Click Logic) ---
         peerAdapter = PeerAdapter { endpointId, endpointName ->
+
+            targetPeerName = endpointName // <--- SAVE NAME HERE
+
             // 1. CRITICAL FIX: Kill the Pulse Timer immediately!
             isDiscovering = false
             handler.removeCallbacksAndMessages(null)
@@ -171,7 +191,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         checkIdentity()
-        
+
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?) {
@@ -242,6 +262,7 @@ class MainActivity : AppCompatActivity() {
 
     private val connectionLifecycleCallback = object : ConnectionLifecycleCallback() {
         override fun onConnectionInitiated(endpointId: String, info: ConnectionInfo) {
+            targetPeerName = info.endpointName
             Nearby.getConnectionsClient(this@MainActivity).stopAdvertising()
             Nearby.getConnectionsClient(this@MainActivity).stopDiscovery()
             Nearby.getConnectionsClient(this@MainActivity).acceptConnection(endpointId, payloadCallback)
@@ -260,9 +281,22 @@ class MainActivity : AppCompatActivity() {
 
                     Nearby.getConnectionsClient(this@MainActivity).stopAdvertising()
                     Nearby.getConnectionsClient(this@MainActivity).stopDiscovery()
+
+                    // SAVE TO DB
+                    val newPeer = PeerEntity(
+                        endpointId = endpointId,
+                        name = targetPeerName, // <--- USE IT HERE
+                        lastSeenTimestamp = System.currentTimeMillis(),
+                        isOnline = true
+                    )
+
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        db.peerDao().insertPeer(newPeer)
+                    }
                 }
                 else -> resetRadio()
             }
+
         }
 
         override fun onDisconnected(endpointId: String) {
@@ -394,8 +428,13 @@ class MainActivity : AppCompatActivity() {
             // We already have a name, load it
             myNickName = userManager.getUsername()!!
             statusText.text = "Status: Ready ($myNickName)"
+
+            // --- ADD THIS MISSING BLOCK ---
+            chatAdapter = ChatAdapter(myNickName)
+            chatRecyclerView.adapter = chatAdapter
+            // -----------------------------
+
         } else {
-            // No name found, ask user to input one
             showNameInputDialog()
         }
     }
@@ -428,5 +467,22 @@ class MainActivity : AppCompatActivity() {
             .create()
 
         dialog.show()
+    }
+
+    private fun loadPeersFromDb() {
+        lifecycleScope.launch(Dispatchers.IO) {
+            val savedPeers = db.peerDao().getAllPeers()
+
+            // Switch to UI thread to update the adapter
+            withContext(Dispatchers.Main) {
+                // We need to teach PeerAdapter to accept List<PeerEntity>
+                // For now, let's just log it to ensure it works
+                Log.d(TAG, "Loaded ${savedPeers.size} peers from history")
+
+                if (::peerAdapter.isInitialized) {
+                    peerAdapter.updateList(savedPeers)
+                }
+            }
+        }
     }
 }
