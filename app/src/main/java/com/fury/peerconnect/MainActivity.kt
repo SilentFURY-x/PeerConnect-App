@@ -169,6 +169,9 @@ class MainActivity : AppCompatActivity() {
                 editMessage.setText("")
             }
         }
+
+        checkIdentity()
+        
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?) {
@@ -314,8 +317,9 @@ class MainActivity : AppCompatActivity() {
         }
 
         statusText.text = "Status: Resetting..."
-        val randomNum = (1000..9999).random()
-        myNickName = "FuryUser-$randomNum"
+
+        val userManager = UserManager(this)
+        myNickName = userManager.getUsername() ?: "Unknown" // Load saved name
 
         // RE-INIT ADAPTER (New Identity = New Adapter)
         chatAdapter = ChatAdapter(myNickName)
@@ -381,5 +385,48 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this, "Location is required for this app", Toast.LENGTH_SHORT).show()
             }
         }
+    }
+
+    private fun checkIdentity() {
+        val userManager = UserManager(this)
+
+        if (userManager.hasIdentity()) {
+            // We already have a name, load it
+            myNickName = userManager.getUsername()!!
+            statusText.text = "Status: Ready ($myNickName)"
+        } else {
+            // No name found, ask user to input one
+            showNameInputDialog()
+        }
+    }
+
+    private fun showNameInputDialog() {
+        val input = EditText(this)
+        input.hint = "Enter your unique ID/Name"
+
+        val dialog = androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("Welcome to PeerConnect")
+            .setMessage("Set your unique identity to be discovered by others.")
+            .setView(input)
+            .setCancelable(false) // User MUST enter a name
+            .setPositiveButton("Save") { _, _ ->
+                val name = input.text.toString()
+                if (name.isNotEmpty()) {
+                    val userManager = UserManager(this)
+                    userManager.saveUsername(name)
+                    myNickName = name
+                    statusText.text = "Status: Ready ($myNickName)"
+
+                    // Re-init adapter with new name
+                    chatAdapter = ChatAdapter(myNickName)
+                    chatRecyclerView.adapter = chatAdapter
+                } else {
+                    Toast.makeText(this, "Name cannot be empty", Toast.LENGTH_SHORT).show()
+                    showNameInputDialog() // Ask again
+                }
+            }
+            .create()
+
+        dialog.show()
     }
 }
