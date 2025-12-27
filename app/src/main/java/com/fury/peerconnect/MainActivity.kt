@@ -24,6 +24,8 @@ import kotlinx.coroutines.launch
 
 class MainActivity : AppCompatActivity() {
 
+
+    private lateinit var chatStatusText: TextView
     private var targetPeerName: String = "" // Add this
 
     // Database
@@ -122,6 +124,10 @@ class MainActivity : AppCompatActivity() {
         peersRecyclerView = findViewById(R.id.peersRecyclerView)
         peersRecyclerView.layoutManager = LinearLayoutManager(this)
 
+
+        chatStatusText = findViewById(R.id.chatStatusText)
+
+
         // --- SETUP PEER ADAPTER (Click Logic) ---
         peerAdapter = PeerAdapter { endpointId, endpointName ->
 
@@ -135,13 +141,13 @@ class MainActivity : AppCompatActivity() {
             Nearby.getConnectionsClient(this).stopDiscovery()
 
             // 3. Update status
-            statusText.text = "Connecting to $endpointName..."
+            updateStatus("Connecting to $endpointName...")
 
             // 4. Request Connection manually
             Nearby.getConnectionsClient(this)
                 .requestConnection(myNickName, endpointId, connectionLifecycleCallback)
                 .addOnFailureListener {
-                    statusText.text = "Connection Failed"
+                    updateStatus("Connection Failed")
                     // If connection fails, user can press Join again manually
                 }
         }
@@ -209,10 +215,10 @@ class MainActivity : AppCompatActivity() {
         Nearby.getConnectionsClient(this)
             .startAdvertising(myNickName, SERVICE_ID, connectionLifecycleCallback, advertisingOptions)
             .addOnSuccessListener {
-                statusText.text = "Status: Advertising... (Waiting for peers)"
+                updateStatus("Status: Advertising... (Waiting for peers)")
             }
             .addOnFailureListener { e ->
-                statusText.text = "Status: Failed to Advertise"
+                updateStatus("Status: Failed to Advertise")
             }
     }
 
@@ -223,7 +229,7 @@ class MainActivity : AppCompatActivity() {
         Nearby.getConnectionsClient(this)
             .startDiscovery(SERVICE_ID, endpointDiscoveryCallback, discoveryOptions)
             .addOnSuccessListener {
-                statusText.text = "Status: Scanning ($myNickName)..."
+                updateStatus("Status: Scanning ($myNickName)...")
 
                 // Pulse Logic (Increased to 10 seconds for stability)
                 handler.postDelayed({
@@ -236,7 +242,7 @@ class MainActivity : AppCompatActivity() {
                 }, 10000) // Changed from 6000 to 10000
             }
             .addOnFailureListener {
-                statusText.text = "Status: Discovery Failed"
+                updateStatus("Status: Discovery Failed")
             }
     }
 
@@ -246,7 +252,7 @@ class MainActivity : AppCompatActivity() {
             Log.d(TAG, "Found: ${info.endpointName}")
 
             // 2. Update status to tell user what to do
-            statusText.text = "Found peers! Select one below."
+            updateStatus("Found peers! Select one below.")
 
             // 3. ADD TO ADAPTER (Safety Check Included)
             // We do NOT stop discovery here. We keep listening for more peers.
@@ -266,13 +272,12 @@ class MainActivity : AppCompatActivity() {
             Nearby.getConnectionsClient(this@MainActivity).stopAdvertising()
             Nearby.getConnectionsClient(this@MainActivity).stopDiscovery()
             Nearby.getConnectionsClient(this@MainActivity).acceptConnection(endpointId, payloadCallback)
-            statusText.text = "Status: Accepting connection..."
-        }
+            updateStatus("Status: Accepting connection...")        }
 
         override fun onConnectionResult(endpointId: String, result: ConnectionResolution) {
             when (result.status.statusCode) {
                 ConnectionsStatusCodes.STATUS_OK -> {
-                    statusText.text = "Status: CONNECTED"
+                    updateStatus("Status: CONNECTED")
                     connectedEndpointId = endpointId
 
                     // UI Changes
@@ -298,7 +303,7 @@ class MainActivity : AppCompatActivity() {
                         val pendingMsgs = db.messageDao().getUnsentMessages(targetPeerName)
                         if (pendingMsgs.isNotEmpty()) {
                             withContext(Dispatchers.Main) {
-                                statusText.text = "Sending ${pendingMsgs.size} pending messages..."
+                                updateStatus("Sending ${pendingMsgs.size} pending messages...")
                             }
 
                             for (msg in pendingMsgs) {
@@ -424,7 +429,7 @@ class MainActivity : AppCompatActivity() {
             peerAdapter.clearPeers()
         }
 
-        statusText.text = "Status: Resetting..."
+        updateStatus("Status: Resetting...")
 
         val userManager = UserManager(this)
         myNickName = userManager.getUsername() ?: "Unknown" // Load saved name
@@ -501,7 +506,7 @@ class MainActivity : AppCompatActivity() {
         if (userManager.hasIdentity()) {
             // We already have a name, load it
             myNickName = userManager.getUsername()!!
-            statusText.text = "Status: Ready ($myNickName)"
+            updateStatus("Status: Ready ($myNickName)")
 
             // --- ADD THIS MISSING BLOCK ---
             chatAdapter = ChatAdapter(myNickName)
@@ -582,11 +587,24 @@ class MainActivity : AppCompatActivity() {
         connectedEndpointId = null
 
         // 2. Update UI (BUT DO NOT HIDE CHAT)
-        statusText.text = "Offline: Waiting to reconnect..."
+        updateStatus("Offline: Waiting to reconnect...")
 
         // 3. Restart scanning to find them again automatically
         // (If you implemented the Auto-Connect phase, call startAutoMode() here)
         // For now, let's just start discovery to find them back
         startDiscovery()
+    }
+
+    // Helper function to update status everywhere
+    private fun updateStatus(text: String) {
+        statusText.text = text
+        chatStatusText.text = text
+
+        // Optional: Change color if offline
+        if (text.contains("Offline") || text.contains("Waiting")) {
+            chatStatusText.setBackgroundColor(android.graphics.Color.RED)
+        } else {
+            chatStatusText.setBackgroundColor(android.graphics.Color.parseColor("#333333"))
+        }
     }
 }

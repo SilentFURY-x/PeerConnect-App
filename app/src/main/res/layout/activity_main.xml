@@ -120,6 +120,20 @@
             app:layout_constraintEnd_toEndOf="parent"
             app:layout_constraintTop_toTopOf="@id/headerBackground" />
 
+        <TextView
+            android:id="@+id/chatStatusText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="#333333"
+            android:padding="4dp"
+            android:text="Status: Connected"
+            android:textAlignment="center"
+            android:textColor="#FFFFFF"
+            android:textSize="12sp"
+            app:layout_constraintTop_toBottomOf="@+id/headerBackground"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintEnd_toEndOf="parent" />
+
         <androidx.recyclerview.widget.RecyclerView
             android:id="@+id/chatRecyclerView"
             android:layout_width="0dp"
@@ -128,7 +142,7 @@
             app:layout_constraintBottom_toTopOf="@id/editMessage"
             app:layout_constraintEnd_toEndOf="parent"
             app:layout_constraintStart_toStartOf="parent"
-            app:layout_constraintTop_toBottomOf="@id/headerBackground" />
+            app:layout_constraintTop_toBottomOf="@+id/chatStatusText" />
 
         <EditText
             android:id="@+id/editMessage"
