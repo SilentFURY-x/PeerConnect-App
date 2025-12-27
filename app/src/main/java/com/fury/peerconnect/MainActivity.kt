@@ -4,6 +4,8 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.widget.Button
 import android.widget.EditText
@@ -24,45 +26,46 @@ import kotlinx.coroutines.launch
 
 class MainActivity : AppCompatActivity() {
 
-
-    private lateinit var chatStatusText: TextView
-    private var targetPeerName: String = "" // Add this
-
-    // Database
-    private lateinit var db: AppDatabase
-
-    // Unique ID for our app (The "Radio Channel")
+    // --- CONFIGURATION ---
+    private val STRATEGY = Strategy.P2P_STAR
     private val SERVICE_ID = "com.fury.peerconnect_v2"
     private val TAG = "PeerConnectDebug"
 
-    private val REQUEST_CHECK_SETTINGS = 1001
-    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
-    private var isDiscovering = false
+    // --- STATE VARIABLES ---
+    private var isPairingMode = false // true = accept strangers; false = friends only
+    private var isHost = false // Are we currently Advertising or Discovering?
     private var myNickName: String = ""
-    private var connectedEndpointId: String? = null
 
-    // UI Elements
+    // CHAT STATE
+    private var currentChatPeerName: String? = null
+    private var currentChatEndpointId: String? = null // Only exists if they are online
+
+    // TRACKING
+    private val pendingConnections = mutableMapOf<String, String>() // Endpoint ID -> Name
+    private val pendingPayloads = mutableMapOf<Long, Long>() // PayloadID -> Database MessageID
+
+    // AUTO-LOOP HANDLER
+    private val handler = Handler(Looper.getMainLooper())
+    private val roleSwitchRunnable = Runnable { switchRoles() }
+
+    // --- DATA ---
+    private lateinit var db: AppDatabase
+    private lateinit var peerAdapter: PeerAdapter
+    private lateinit var chatAdapter: ChatAdapter
+
+    // --- UI ELEMENTS ---
     private lateinit var statusText: TextView
-    private lateinit var btnHost: Button
-    private lateinit var btnJoin: Button
-    private lateinit var btnDisconnect: Button
+    private lateinit var chatStatusText: TextView
+    private lateinit var btnAddContact: Button
 
-    // NEW UI Elements for Chat
     private lateinit var layoutConnection: ConstraintLayout
     private lateinit var layoutChat: ConstraintLayout
-    private lateinit var btnExitChat: Button
+
+    private lateinit var peersRecyclerView: RecyclerView
     private lateinit var chatRecyclerView: RecyclerView
     private lateinit var editMessage: EditText
     private lateinit var btnSend: Button
-
-    // Peer List UI
-    private lateinit var peersRecyclerView: RecyclerView
-    private lateinit var peerAdapter: PeerAdapter
-
-    // Adapter
-    private lateinit var chatAdapter: ChatAdapter
-
-    private val STRATEGY = Strategy.P2P_STAR
+    private lateinit var btnExitChat: Button
 
     // --- PERMISSIONS ---
     private val requiredPermissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -73,13 +76,6 @@ class MainActivity : AppCompatActivity() {
             Manifest.permission.ACCESS_FINE_LOCATION,
             Manifest.permission.NEARBY_WIFI_DEVICES
         )
-    } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-        arrayOf(
-            Manifest.permission.BLUETOOTH_SCAN,
-            Manifest.permission.BLUETOOTH_ADVERTISE,
-            Manifest.permission.BLUETOOTH_CONNECT,
-            Manifest.permission.ACCESS_FINE_LOCATION
-        )
     } else {
         arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
     }
@@ -89,11 +85,11 @@ class MainActivity : AppCompatActivity() {
     ) { permissions ->
         if (permissions.entries.all { it.value }) {
             Toast.makeText(this, "Permissions Granted!", Toast.LENGTH_SHORT).show()
+            startAutoMode()
         } else {
             Toast.makeText(this, "Permissions Denied. App won't work.", Toast.LENGTH_LONG).show()
         }
     }
-
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -101,229 +97,255 @@ class MainActivity : AppCompatActivity() {
 
         db = AppDatabase.getDatabase(this)
 
-// Reset everyone to "Offline" when app opens
+        // 1. Reset Status & Load History
         lifecycleScope.launch(Dispatchers.IO) {
-            db.peerDao().setAllOffline()
-            loadPeersFromDb() // Show the history immediately
+            db.peerDao().setAllOffline() // Everyone starts offline
+            loadPeersFromDb()
         }
 
-        // 1. INITIALIZE ALL VIEWS (This prevents the crash!)
+        // 2. Initialize UI
         statusText = findViewById(R.id.statusText)
-        btnHost = findViewById(R.id.btnHost)
-        btnJoin = findViewById(R.id.btnJoin)
-        btnDisconnect = findViewById(R.id.btnDisconnect)
+        chatStatusText = findViewById(R.id.chatStatusText)
+
+        btnAddContact = findViewById(R.id.btnHost)
+        btnAddContact.text = "Add New Contact"
+
+        findViewById<Button>(R.id.btnJoin).visibility = android.view.View.GONE
+        findViewById<Button>(R.id.btnDisconnect).visibility = android.view.View.GONE
 
         layoutConnection = findViewById(R.id.layoutConnection)
         layoutChat = findViewById(R.id.layoutChat)
         btnExitChat = findViewById(R.id.btnExitChat)
-        chatRecyclerView = findViewById(R.id.chatRecyclerView)
-        editMessage = findViewById(R.id.editMessage)
-        btnSend = findViewById(R.id.btnSend)
 
-        // --- INITIALIZE PEER LIST VIEWS ---
         peersRecyclerView = findViewById(R.id.peersRecyclerView)
         peersRecyclerView.layoutManager = LinearLayoutManager(this)
 
-
-        chatStatusText = findViewById(R.id.chatStatusText)
-
-
-        // --- SETUP PEER ADAPTER (Click Logic) ---
-        peerAdapter = PeerAdapter { endpointId, endpointName ->
-
-            targetPeerName = endpointName // <--- SAVE NAME HERE
-
-            // 1. CRITICAL FIX: Kill the Pulse Timer immediately!
-            isDiscovering = false
-            handler.removeCallbacksAndMessages(null)
-
-            // 2. Stop scanning (we found who we want)
-            Nearby.getConnectionsClient(this).stopDiscovery()
-
-            // 3. Update status
-            updateStatus("Connecting to $endpointName...")
-
-            // 4. Request Connection manually
-            Nearby.getConnectionsClient(this)
-                .requestConnection(myNickName, endpointId, connectionLifecycleCallback)
-                .addOnFailureListener {
-                    updateStatus("Connection Failed")
-                    // If connection fails, user can press Join again manually
-                }
-        }
-
-        peersRecyclerView.adapter = peerAdapter
-
-        // Setup RecyclerView
+        chatRecyclerView = findViewById(R.id.chatRecyclerView)
         chatRecyclerView.layoutManager = LinearLayoutManager(this)
 
-        Nearby.getConnectionsClient(this).stopAllEndpoints()
+        editMessage = findViewById(R.id.editMessage)
+        btnSend = findViewById(R.id.btnSend)
 
-        if (!hasPermissions()) {
-            permissionLauncher.launch(requiredPermissions)
+        // 3. SETUP ADAPTER
+        peerAdapter = PeerAdapter { peer ->
+            openChat(peer.name, if (peer.isOnline) peer.endpointId else null)
         }
+        peersRecyclerView.adapter = peerAdapter
 
-        // --- BUTTON LISTENERS ---
-        btnHost.setOnClickListener {
-            resetRadio {
-                checkLocationAndStart { startAdvertising() }
-            }
-        }
+        checkIdentity()
 
-        btnJoin.setOnClickListener {
-            resetRadio {
-                checkLocationAndStart { startDiscovery() }
-            }
-        }
-
-        btnDisconnect.setOnClickListener {
-            resetRadio {
-                Toast.makeText(this, "Reset Complete", Toast.LENGTH_SHORT).show()
-            }
-        }
-
-        btnExitChat.setOnClickListener {
-            resetRadio {
-                Toast.makeText(this, "Left Chat", Toast.LENGTH_SHORT).show()
+        // 4. LISTENERS
+        btnAddContact.setOnClickListener {
+            if (isPairingMode) {
+                isPairingMode = false
+                btnAddContact.text = "Add New Contact"
+                btnAddContact.setBackgroundColor(android.graphics.Color.parseColor("#6200EE"))
+                startAutoMode()
+            } else {
+                showPairingDialog()
             }
         }
 
         btnSend.setOnClickListener {
             val text = editMessage.text.toString()
-            if (text.isNotEmpty()) {
-                sendMessage(text)
-                editMessage.setText("")
-            }
+            if (text.isNotEmpty()) sendMessage(text)
         }
 
-        checkIdentity()
+        btnExitChat.setOnClickListener { closeChat() }
 
+        Nearby.getConnectionsClient(this).stopAllEndpoints()
+
+        if (hasPermissions()) startAutoMode() else permissionLauncher.launch(requiredPermissions)
     }
 
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        // (Keep your existing GPS check logic here, omitted for brevity but don't delete it)
-        if (requestCode == 1001) { /* ... */ }
+    // --- NAVIGATION ---
+
+    private fun openChat(peerName: String, endpointId: String?) {
+        currentChatPeerName = peerName
+        currentChatEndpointId = endpointId
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            val history = db.messageDao().getChatHistory(myNickName, peerName)
+            withContext(Dispatchers.Main) { updateChatUI(history) }
+        }
+
+        layoutConnection.visibility = android.view.View.GONE
+        layoutChat.visibility = android.view.View.VISIBLE
+
+        updateStatus(if (endpointId != null) "Connected" else "Offline")
+        findViewById<TextView>(R.id.chatHeader).text = peerName
     }
 
-    // --- LOGIC ---
+    private fun closeChat() {
+        currentChatPeerName = null
+        currentChatEndpointId = null
+        layoutChat.visibility = android.view.View.GONE
+        layoutConnection.visibility = android.view.View.VISIBLE
+        updateStatus("Status: Scanning...")
+    }
+
+    // --- ENGINE: AUTO-CONNECT LOOP ---
+
+    private fun startAutoMode() {
+        handler.removeCallbacks(roleSwitchRunnable)
+        switchRoles()
+    }
+
+    private fun switchRoles() {
+        // If chatting, don't switch roles (keep connection alive)
+        if (currentChatEndpointId != null) return
+
+        val client = Nearby.getConnectionsClient(this)
+        client.stopAdvertising()
+        client.stopDiscovery()
+
+        isHost = !isHost
+
+        // CACHE FLUSH: 600ms delay to let Bluetooth radio reset
+        handler.postDelayed({
+            if (isHost) startAdvertising() else startDiscovery()
+        }, 600)
+
+        // STABLE TIMING: 6-10s to allow P2P_STAR to stabilize
+        val randomDelay = (6000..10000).random().toLong()
+        handler.postDelayed(roleSwitchRunnable, randomDelay)
+    }
 
     private fun startAdvertising() {
-        Nearby.getConnectionsClient(this).stopDiscovery()
         val advertisingOptions = AdvertisingOptions.Builder().setStrategy(STRATEGY).setLowPower(false).build()
-
         Nearby.getConnectionsClient(this)
             .startAdvertising(myNickName, SERVICE_ID, connectionLifecycleCallback, advertisingOptions)
-            .addOnSuccessListener {
-                updateStatus("Status: Advertising... (Waiting for peers)")
-            }
-            .addOnFailureListener { e ->
-                updateStatus("Status: Failed to Advertise")
-            }
+            .addOnSuccessListener { updateStatus("Auto: Advertising...") }
     }
 
     private fun startDiscovery() {
-        isDiscovering = true
         val discoveryOptions = DiscoveryOptions.Builder().setStrategy(STRATEGY).build()
-
         Nearby.getConnectionsClient(this)
             .startDiscovery(SERVICE_ID, endpointDiscoveryCallback, discoveryOptions)
-            .addOnSuccessListener {
-                updateStatus("Status: Scanning ($myNickName)...")
-
-                // Pulse Logic (Increased to 10 seconds for stability)
-                handler.postDelayed({
-                    // CRITICAL CHECK: Only restart if we are STILL discovering.
-                    // If the user clicked a name, isDiscovering will be false, and this won't run.
-                    if (isDiscovering) {
-                        Nearby.getConnectionsClient(this@MainActivity).stopDiscovery()
-                        startDiscovery()
-                    }
-                }, 10000) // Changed from 6000 to 10000
-            }
-            .addOnFailureListener {
-                updateStatus("Status: Discovery Failed")
-            }
+            .addOnSuccessListener { updateStatus("Auto: Scanning...") }
     }
+
+    // --- DISCONNECTION HELPER (FAIL FAST) ---
+    private fun handleExplicitDisconnect(endpointId: String) {
+        // Prevent double-processing
+        if (!pendingConnections.containsKey(endpointId) && currentChatEndpointId != endpointId) return
+
+        Log.e(TAG, "Handling Explicit Disconnect for $endpointId")
+
+        // 1. Update UI state if active chat
+        if (endpointId == currentChatEndpointId) {
+            currentChatEndpointId = null
+            updateStatus("Offline (Connection Lost)")
+        }
+        pendingConnections.remove(endpointId)
+
+        // 2. Kill connection in API
+        Nearby.getConnectionsClient(this).disconnectFromEndpoint(endpointId)
+
+        // 3. Mark Offline in DB
+        lifecycleScope.launch(Dispatchers.IO) {
+            db.peerDao().setAllOffline()
+            loadPeersFromDb()
+        }
+
+        // 4. RESTART SEARCH IMMEDIATELY
+        startAutoMode()
+    }
+
+    // --- CALLBACKS ---
 
     private val endpointDiscoveryCallback = object : EndpointDiscoveryCallback() {
         override fun onEndpointFound(endpointId: String, info: DiscoveredEndpointInfo) {
-            // 1. Log it
-            Log.d(TAG, "Found: ${info.endpointName}")
-
-            // 2. Update status to tell user what to do
-            updateStatus("Found peers! Select one below.")
-
-            // 3. ADD TO ADAPTER (Safety Check Included)
-            // We do NOT stop discovery here. We keep listening for more peers.
-            if (::peerAdapter.isInitialized) {
-                peerAdapter.addPeer(endpointId, info)
+            val foundName = info.endpointName
+            lifecycleScope.launch(Dispatchers.IO) {
+                val isKnown = db.peerDao().isKnownPeer(foundName)
+                withContext(Dispatchers.Main) {
+                    if (isKnown || isPairingMode) {
+                        Nearby.getConnectionsClient(this@MainActivity)
+                            .requestConnection(myNickName, endpointId, connectionLifecycleCallback)
+                        handler.removeCallbacks(roleSwitchRunnable)
+                    }
+                }
             }
         }
-
-        override fun onEndpointLost(endpointId: String) {
-            // Optional: Remove them from the list if they walk away
-        }
+        override fun onEndpointLost(endpointId: String) {}
     }
 
     private val connectionLifecycleCallback = object : ConnectionLifecycleCallback() {
         override fun onConnectionInitiated(endpointId: String, info: ConnectionInfo) {
-            targetPeerName = info.endpointName
-            Nearby.getConnectionsClient(this@MainActivity).stopAdvertising()
-            Nearby.getConnectionsClient(this@MainActivity).stopDiscovery()
+            val incomingName = info.endpointName
+            pendingConnections[endpointId] = incomingName
+
+            // INSTANT ACCEPT
             Nearby.getConnectionsClient(this@MainActivity).acceptConnection(endpointId, payloadCallback)
-            updateStatus("Status: Accepting connection...")        }
+
+            lifecycleScope.launch(Dispatchers.IO) {
+                val isKnown = db.peerDao().isKnownPeer(incomingName)
+                if (!isKnown && !isPairingMode) {
+                    // Stranger -> Disconnect
+                    Nearby.getConnectionsClient(this@MainActivity).disconnectFromEndpoint(endpointId)
+                } else {
+                    handler.removeCallbacks(roleSwitchRunnable)
+                }
+            }
+        }
 
         override fun onConnectionResult(endpointId: String, result: ConnectionResolution) {
-            when (result.status.statusCode) {
-                ConnectionsStatusCodes.STATUS_OK -> {
-                    updateStatus("Status: CONNECTED")
-                    connectedEndpointId = endpointId
+            val peerName = pendingConnections[endpointId] ?: return
 
-                    // UI Changes
-                    layoutConnection.visibility = android.view.View.GONE
-                    layoutChat.visibility = android.view.View.VISIBLE
+            if (result.status.statusCode == ConnectionsStatusCodes.STATUS_OK) {
+                // 1. PAIRING LOGIC
+                if (isPairingMode) {
+                    isPairingMode = false
+                    btnAddContact.text = "Add New Contact"
+                    btnAddContact.setBackgroundColor(android.graphics.Color.parseColor("#6200EE"))
 
-                    Nearby.getConnectionsClient(this@MainActivity).stopAdvertising()
-                    Nearby.getConnectionsClient(this@MainActivity).stopDiscovery()
-
-                    // --- NEW DATABASE LOGIC STARTS HERE ---
                     lifecycleScope.launch(Dispatchers.IO) {
-                        // A. Save the Peer Connection
-                        val newPeer = PeerEntity(endpointId, targetPeerName, System.currentTimeMillis(), true)
-                        db.peerDao().insertPeer(newPeer)
+                        db.peerDao().insertPeer(PeerEntity(name = peerName, endpointId = endpointId, lastSeenTimestamp = System.currentTimeMillis(), isOnline = true))
+                        loadPeersFromDb()
+                    }
+                    startAutoMode() // Restart loop to background
+                }
 
-                        // B. Load Chat History
-                        val history = db.messageDao().getChatHistory(myNickName, targetPeerName)
-                        withContext(Dispatchers.Main) {
-                            updateChatUI(history)
-                        }
+                // 2. UPDATE DB & UI
+                lifecycleScope.launch(Dispatchers.IO) {
+                    db.peerDao().insertPeer(PeerEntity(name = peerName, endpointId = endpointId, lastSeenTimestamp = System.currentTimeMillis(), isOnline = true))
 
-                        // C. RESILIENCY CHECK (Send Unsent Messages)
-                        val pendingMsgs = db.messageDao().getUnsentMessages(targetPeerName)
-                        if (pendingMsgs.isNotEmpty()) {
-                            withContext(Dispatchers.Main) {
-                                updateStatus("Sending ${pendingMsgs.size} pending messages...")
-                            }
-
-                            for (msg in pendingMsgs) {
-                                // 1. Send
-                                val chatPayload = ChatMessage(myNickName, msg.text, msg.timestamp)
-                                Nearby.getConnectionsClient(this@MainActivity).sendPayload(endpointId, Payload.fromBytes(serialize(chatPayload)))
-
-                                // 2. Mark as Sent in DB
-                                db.messageDao().markAsSent(msg.id)
-                            }
+                    withContext(Dispatchers.Main) {
+                        peerAdapter.updatePeerStatus(peerName, true)
+                        if (currentChatPeerName == peerName) {
+                            currentChatEndpointId = endpointId
+                            updateStatus("Connected")
                         }
                     }
-                    // --- NEW DATABASE LOGIC ENDS HERE ---
+
+                    // 3. RESILIENCY (Send Pending)
+                    val pendingMsgs = db.messageDao().getUnsentMessages(peerName)
+                    if (pendingMsgs.isNotEmpty()) {
+                        withContext(Dispatchers.Main) { updateStatus("Sending ${pendingMsgs.size} offline messages...") }
+                        for (msg in pendingMsgs) {
+                            val chatPayload = ChatMessage(myNickName, msg.text, msg.timestamp)
+                            val payload = Payload.fromBytes(serialize(chatPayload))
+
+                            // Map pending payload
+                            pendingPayloads[payload.id] = msg.id.toLong()
+
+                            Nearby.getConnectionsClient(this@MainActivity)
+                                .sendPayload(endpointId, payload)
+                                .addOnFailureListener {
+                                    pendingPayloads.remove(payload.id)
+                                    // If fail here, we don't force disconnect yet, just leave pending
+                                }
+                        }
+                    }
                 }
-                else -> resetRadio()
+            } else {
+                startAutoMode()
             }
         }
 
         override fun onDisconnected(endpointId: String) {
-            onSignalLost()
+            handleExplicitDisconnect(endpointId)
         }
     }
 
@@ -331,120 +353,173 @@ class MainActivity : AppCompatActivity() {
         override fun onPayloadReceived(endpointId: String, payload: Payload) {
             if (payload.type == Payload.Type.BYTES) {
                 val receivedBytes = payload.asBytes()!!
-                val receivedMessage = deserialize(receivedBytes)
-
-                // 1. Create Entity
-                val msgEntity = MessageEntity(
-                    senderId = receivedMessage.senderName, // The sender's name
-                    receiverId = myNickName,           // It was sent to ME
-                    text = receivedMessage.messageBody,
-                    timestamp = receivedMessage.time,
-                    isSent = true // Received means it was sent successfully
-                )
-
-                // 2. Save & Update UI
+                val msg = deserialize(receivedBytes)
                 lifecycleScope.launch(Dispatchers.IO) {
-                    db.messageDao().insertMessage(msgEntity)
-
-                    // Reload to keep order correct
-                    val history = db.messageDao().getChatHistory(myNickName, targetPeerName)
-                    withContext(Dispatchers.Main) {
-                        updateChatUI(history)
+                    db.messageDao().insertMessage(MessageEntity(
+                        senderId = msg.senderName, receiverId = myNickName, text = msg.messageBody, timestamp = msg.time, isSent = true
+                    ))
+                    if (currentChatPeerName == msg.senderName) {
+                        val history = db.messageDao().getChatHistory(myNickName, msg.senderName)
+                        withContext(Dispatchers.Main) { updateChatUI(history) }
                     }
                 }
             }
         }
-        override fun onPayloadTransferUpdate(endpointId: String, update: PayloadTransferUpdate) {}
+
+        override fun onPayloadTransferUpdate(endpointId: String, update: PayloadTransferUpdate) {
+            if (update.status == PayloadTransferUpdate.Status.SUCCESS) {
+                val dbMsgId = pendingPayloads[update.payloadId]
+                if (dbMsgId != null) {
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        db.messageDao().markAsSent(dbMsgId.toInt())
+                        pendingPayloads.remove(update.payloadId)
+                    }
+                }
+            }
+        }
     }
 
+    // --- MESSAGING (PESSIMISTIC SENDING) ---
+
     private fun sendMessage(messageText: String) {
-        // 1. Determine status
-        // If we have an endpoint ID, we are connected. If null, we are disconnected.
-        val isConnected = connectedEndpointId != null
+        val peerName = currentChatPeerName ?: return
+        val endpointId = currentChatEndpointId
+        val canTrySending = endpointId != null
 
-        // 2. Create the Entity
-        val msgEntity = MessageEntity(
-            senderId = myNickName,
-            receiverId = targetPeerName, // Who are we talking to?
-            text = messageText,
-            timestamp = System.currentTimeMillis(),
-            isSent = isConnected // TRUE if connected, FALSE if "pending"
-        )
-
-        // 3. Save to DB (Always!)
         lifecycleScope.launch(Dispatchers.IO) {
-            db.messageDao().insertMessage(msgEntity)
+            // 1. SAVE AS PENDING
+            val msgEntity = MessageEntity(
+                senderId = myNickName, receiverId = peerName, text = messageText, timestamp = System.currentTimeMillis(), isSent = false
+            )
+            val newMsgId = db.messageDao().insertMessage(msgEntity)
 
-            // 4. Update UI immediately
-            val history = db.messageDao().getChatHistory(myNickName, targetPeerName)
-            withContext(Dispatchers.Main) {
-                updateChatUI(history)
+            // 2. SHOW IN UI
+            val history = db.messageDao().getChatHistory(myNickName, peerName)
+            withContext(Dispatchers.Main) { updateChatUI(history) }
+
+            // 3. TRY SEND
+            if (canTrySending) {
+                val chatMessage = ChatMessage(myNickName, messageText, System.currentTimeMillis())
+                val payload = Payload.fromBytes(serialize(chatMessage))
+
+                pendingPayloads[payload.id] = newMsgId
+
+                Nearby.getConnectionsClient(this@MainActivity)
+                    .sendPayload(endpointId!!, payload)
+                    .addOnFailureListener {
+                        // FAIL FAST
+                        Log.e(TAG, "Send Failed. Disconnecting.")
+                        pendingPayloads.remove(payload.id)
+
+                        // FIX: Called directly (No withContext needed here)
+                        handleExplicitDisconnect(endpointId)
+                    }
             }
         }
-
-        // 5. Actually Send (If possible)
-        if (isConnected) {
-            val chatMessage = ChatMessage(myNickName, messageText, System.currentTimeMillis())
-
-            Nearby.getConnectionsClient(this)
-                .sendPayload(connectedEndpointId!!, Payload.fromBytes(serialize(chatMessage)))
-                .addOnFailureListener {
-                    // SENDING FAILED (e.g., Radio turned off suddenly)
-                    // We need to flip the DB entry back to isSent = false
-                    lifecycleScope.launch(Dispatchers.IO) {
-                        // We need the ID of the message we just inserted.
-                        // For simplicity in this fix, we assume the last inserted message is the one.
-                        // A better way is to have insertMessage return the new ID.
-
-                        // For now, let's just Toast so you know it happened
-                        withContext(Dispatchers.Main) {
-                            Toast.makeText(this@MainActivity, "Send failed. Saved as pending.", Toast.LENGTH_SHORT).show()
-                        }
-                    }
-                }
-        } else {
-            Toast.makeText(this, "Saved (Offline). Will send when reconnected.", Toast.LENGTH_SHORT).show()
-        }
-
-        // Clear input
         editMessage.setText("")
     }
 
-    private fun resetRadio(onFinished: () -> Unit = {}) {
-        isDiscovering = false
-        handler.removeCallbacksAndMessages(null)
-        connectedEndpointId = null
+    // --- HELPERS ---
 
-        // SWITCH BACK TO MAIN SCREEN
-        layoutConnection.visibility = android.view.View.VISIBLE
-        layoutChat.visibility = android.view.View.GONE
-
-        Nearby.getConnectionsClient(this).stopAllEndpoints()
-        Nearby.getConnectionsClient(this).stopAdvertising()
-        Nearby.getConnectionsClient(this).stopDiscovery()
-
-        // --- CLEAR PEER LIST ---
-        // We check 'isInitialized' to avoid crashes if the app just started
-        if (::peerAdapter.isInitialized) {
-            peerAdapter.clearPeers()
+    private fun showPairingDialog() {
+        val options = arrayOf("Receive (Host)", "Send (Join)")
+        val builder = androidx.appcompat.app.AlertDialog.Builder(this)
+        builder.setTitle("Pairing Mode")
+        builder.setItems(options) { _, which ->
+            if (which == 0) startManualHost() else startManualJoin()
         }
-
-        updateStatus("Status: Resetting...")
-
-        val userManager = UserManager(this)
-        myNickName = userManager.getUsername() ?: "Unknown" // Load saved name
-
-        // RE-INIT ADAPTER (New Identity = New Adapter)
-        chatAdapter = ChatAdapter(myNickName)
-        chatRecyclerView.adapter = chatAdapter
-
-        statusText.postDelayed({
-            statusText.text = "Status: Ready ($myNickName)"
-            onFinished()
-        }, 1500)
+        builder.setNegativeButton("Cancel") { dialog, _ ->
+            dialog.dismiss()
+            startAutoMode()
+        }
+        builder.show()
     }
 
-    // --- HELPERS ---
+    private fun startManualHost() {
+        handler.removeCallbacks(roleSwitchRunnable)
+        Nearby.getConnectionsClient(this).stopDiscovery()
+        Nearby.getConnectionsClient(this).stopAdvertising()
+        isPairingMode = true
+        isHost = true
+        updateStatus("Pairing: Hosting (Visible)...")
+        btnAddContact.text = "Hosting... (Tap to Cancel)"
+        btnAddContact.setBackgroundColor(android.graphics.Color.RED)
+        val options = AdvertisingOptions.Builder().setStrategy(STRATEGY).setLowPower(false).build()
+        Nearby.getConnectionsClient(this).startAdvertising(myNickName, SERVICE_ID, connectionLifecycleCallback, options)
+    }
+
+    private fun startManualJoin() {
+        handler.removeCallbacks(roleSwitchRunnable)
+        Nearby.getConnectionsClient(this).stopAdvertising()
+        Nearby.getConnectionsClient(this).stopDiscovery()
+        isPairingMode = true
+        isHost = false
+        updateStatus("Pairing: Scanning...")
+        btnAddContact.text = "Scanning... (Tap to Cancel)"
+        btnAddContact.setBackgroundColor(android.graphics.Color.BLUE)
+        val options = DiscoveryOptions.Builder().setStrategy(STRATEGY).build()
+        Nearby.getConnectionsClient(this).startDiscovery(SERVICE_ID, endpointDiscoveryCallback, options)
+    }
+
+    private fun updateStatus(text: String) {
+        statusText.text = text
+        chatStatusText.text = text
+        if (text.contains("Offline") || text.contains("Waiting") || text.contains("Scanning")) {
+            chatStatusText.setBackgroundColor(android.graphics.Color.RED)
+        } else if (text.contains("Connected")) {
+            chatStatusText.setBackgroundColor(android.graphics.Color.parseColor("#4CAF50"))
+        } else {
+            chatStatusText.setBackgroundColor(android.graphics.Color.parseColor("#333333"))
+        }
+    }
+
+    private fun updateChatUI(history: List<MessageEntity>) {
+        val chatMessages = history.map { entity ->
+            ChatMessage(senderName = entity.senderId, messageBody = entity.text, time = entity.timestamp)
+        }
+        chatAdapter.setMessages(chatMessages)
+        if (chatAdapter.itemCount > 0) chatRecyclerView.scrollToPosition(chatAdapter.itemCount - 1)
+    }
+
+    private fun checkIdentity() {
+        val userManager = UserManager(this)
+        if (userManager.hasIdentity()) {
+            myNickName = userManager.getUsername()!!
+            updateStatus("Status: Ready ($myNickName)")
+            chatAdapter = ChatAdapter(myNickName)
+            chatRecyclerView.adapter = chatAdapter
+        } else {
+            showNameInputDialog()
+        }
+    }
+
+    private fun showNameInputDialog() {
+        val input = EditText(this)
+        input.hint = "Enter your unique ID/Name"
+        val dialog = androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("Welcome")
+            .setView(input).setCancelable(false)
+            .setPositiveButton("Save") { _, _ ->
+                val name = input.text.toString()
+                if (name.isNotEmpty()) {
+                    UserManager(this).saveUsername(name)
+                    checkIdentity()
+                } else {
+                    showNameInputDialog()
+                }
+            }.create()
+        dialog.show()
+    }
+
+    private fun loadPeersFromDb() {
+        lifecycleScope.launch(Dispatchers.IO) {
+            val savedPeers = db.peerDao().getAllPeers()
+            withContext(Dispatchers.Main) {
+                if (::peerAdapter.isInitialized) peerAdapter.updateList(savedPeers)
+            }
+        }
+    }
+
     private fun serialize(message: ChatMessage): ByteArray {
         val outputStream = java.io.ByteArrayOutputStream()
         val objectStream = java.io.ObjectOutputStream(outputStream)
@@ -459,152 +534,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun hasPermissions(): Boolean {
-        return requiredPermissions.all {
-            ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
-        }
-    }
-
-    private fun checkLocationAndStart(action: () -> Unit) {
-        // 1. Create a Location Request (We just need it "Balanced" for Bluetooth)
-        val locationRequest = com.google.android.gms.location.LocationRequest.Builder(
-            com.google.android.gms.location.Priority.PRIORITY_BALANCED_POWER_ACCURACY, 1000
-        ).build()
-
-        // 2. Create the Settings Request
-        val builder = com.google.android.gms.location.LocationSettingsRequest.Builder()
-            .addLocationRequest(locationRequest)
-
-        val client = com.google.android.gms.location.LocationServices.getSettingsClient(this)
-        val task = client.checkLocationSettings(builder.build())
-
-        // 3. SUCCESS: Location is already ON
-        task.addOnSuccessListener {
-            action() // Run the code we passed in (e.g., startDiscovery)
-        }
-
-        // 4. FAILURE: Location is OFF -> Show the Popup
-        task.addOnFailureListener { exception ->
-            if (exception is com.google.android.gms.common.api.ResolvableApiException) {
-                // Location settings are not satisfied, but this can be fixed
-                // by showing the user a dialog.
-                try {
-                    // Show the dialog by calling startResolutionForResult()
-                    exception.startResolutionForResult(this@MainActivity, REQUEST_CHECK_SETTINGS)
-                } catch (sendEx: android.content.IntentSender.SendIntentException) {
-                    // Ignore the error.
-                }
-            } else {
-                // Location settings are not satisfied and we can't fix it.
-                Toast.makeText(this, "Location is required for this app", Toast.LENGTH_SHORT).show()
-            }
-        }
-    }
-
-    private fun checkIdentity() {
-        val userManager = UserManager(this)
-
-        if (userManager.hasIdentity()) {
-            // We already have a name, load it
-            myNickName = userManager.getUsername()!!
-            updateStatus("Status: Ready ($myNickName)")
-
-            // --- ADD THIS MISSING BLOCK ---
-            chatAdapter = ChatAdapter(myNickName)
-            chatRecyclerView.adapter = chatAdapter
-            // -----------------------------
-
-        } else {
-            showNameInputDialog()
-        }
-    }
-
-    private fun showNameInputDialog() {
-        val input = EditText(this)
-        input.hint = "Enter your unique ID/Name"
-
-        val dialog = androidx.appcompat.app.AlertDialog.Builder(this)
-            .setTitle("Welcome to PeerConnect")
-            .setMessage("Set your unique identity to be discovered by others.")
-            .setView(input)
-            .setCancelable(false) // User MUST enter a name
-            .setPositiveButton("Save") { _, _ ->
-                val name = input.text.toString()
-                if (name.isNotEmpty()) {
-                    val userManager = UserManager(this)
-                    userManager.saveUsername(name)
-                    myNickName = name
-                    statusText.text = "Status: Ready ($myNickName)"
-
-                    // Re-init adapter with new name
-                    chatAdapter = ChatAdapter(myNickName)
-                    chatRecyclerView.adapter = chatAdapter
-                } else {
-                    Toast.makeText(this, "Name cannot be empty", Toast.LENGTH_SHORT).show()
-                    showNameInputDialog() // Ask again
-                }
-            }
-            .create()
-
-        dialog.show()
-    }
-
-    private fun loadPeersFromDb() {
-        lifecycleScope.launch(Dispatchers.IO) {
-            val savedPeers = db.peerDao().getAllPeers()
-
-            // Switch to UI thread to update the adapter
-            withContext(Dispatchers.Main) {
-                // We need to teach PeerAdapter to accept List<PeerEntity>
-                // For now, let's just log it to ensure it works
-                Log.d(TAG, "Loaded ${savedPeers.size} peers from history")
-
-                if (::peerAdapter.isInitialized) {
-                    peerAdapter.updateList(savedPeers)
-                }
-            }
-        }
-    }
-
-    // Helper to convert DB entities to ChatAdapter format
-    private fun updateChatUI(history: List<MessageEntity>) {
-        val chatMessages = history.map { entity ->
-            ChatMessage(
-                senderName = entity.senderId,
-                messageBody = entity.text,
-                time = entity.timestamp
-            )
-        }
-        // Now you can just call this single line:
-        chatAdapter.setMessages(chatMessages)
-
-        if (chatAdapter.itemCount > 0) {
-            chatRecyclerView.scrollToPosition(chatAdapter.itemCount - 1)
-        }
-    }
-
-    private fun onSignalLost() {
-        // 1. Mark as disconnected
-        connectedEndpointId = null
-
-        // 2. Update UI (BUT DO NOT HIDE CHAT)
-        updateStatus("Offline: Waiting to reconnect...")
-
-        // 3. Restart scanning to find them again automatically
-        // (If you implemented the Auto-Connect phase, call startAutoMode() here)
-        // For now, let's just start discovery to find them back
-        startDiscovery()
-    }
-
-    // Helper function to update status everywhere
-    private fun updateStatus(text: String) {
-        statusText.text = text
-        chatStatusText.text = text
-
-        // Optional: Change color if offline
-        if (text.contains("Offline") || text.contains("Waiting")) {
-            chatStatusText.setBackgroundColor(android.graphics.Color.RED)
-        } else {
-            chatStatusText.setBackgroundColor(android.graphics.Color.parseColor("#333333"))
-        }
+        return requiredPermissions.all { ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }
     }
 }

@@ -19,7 +19,8 @@ interface PeerDao {
     @Query("UPDATE peers SET isOnline = 0")
     suspend fun setAllOffline()
 
-    // Check if a peer exists
-    @Query("SELECT EXISTS(SELECT 1 FROM peers WHERE endpointId = :id)")
-    suspend fun isKnownPeer(id: String): Boolean
+    // CHECK (By Name - Required for Auto-Connect)
+    @Query("SELECT EXISTS(SELECT 1 FROM peers WHERE name = :peerName)")
+    suspend fun isKnownPeer(peerName: String): Boolean
+
 }

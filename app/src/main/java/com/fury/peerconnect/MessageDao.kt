@@ -7,7 +7,7 @@ import androidx.room.Query
 @Dao
 interface MessageDao {
     @Insert
-    suspend fun insertMessage(msg: MessageEntity)
+    suspend fun insertMessage(msg: MessageEntity): Long
 
     // Get chat history between ME and ONE FRIEND
     // This complicated query gets messages where:

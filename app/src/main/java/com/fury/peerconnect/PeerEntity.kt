@@ -5,8 +5,10 @@ import androidx.room.PrimaryKey
 
 @Entity(tableName = "peers")
 data class PeerEntity(
-    @PrimaryKey val endpointId: String, // Unique ID (e.g., "FuryUser-1234")
-    val name: String,
+    // 'name' is now the Unique Key.
+    @PrimaryKey val name: String,
+
+    val endpointId: String, // This will update every time they reconnect
     val lastSeenTimestamp: Long,
-    val isOnline: Boolean = false // We will reset this to false when app starts
+    val isOnline: Boolean = false
 )

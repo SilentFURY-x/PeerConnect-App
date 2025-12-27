@@ -12,7 +12,7 @@
         android:layout_height="match_parent"
         android:padding="24dp"
         android:visibility="visible"
-        tools:visibility="gone">
+        tools:visibility="visible">
 
         <TextView
             android:id="@+id/statusText"
@@ -31,61 +31,55 @@
         <androidx.recyclerview.widget.RecyclerView
             android:id="@+id/peersRecyclerView"
             android:layout_width="0dp"
-            android:layout_height="371dp"
+            android:layout_height="0dp"
             app:layout_constraintBottom_toTopOf="@+id/btnHost"
             app:layout_constraintEnd_toEndOf="parent"
             app:layout_constraintHorizontal_bias="1.0"
             app:layout_constraintStart_toStartOf="parent"
             app:layout_constraintTop_toBottomOf="@+id/statusText"
-            app:layout_constraintVertical_bias="0.75" />
+            app:layout_constraintVertical_bias="0.0"
+            android:layout_marginBottom="16dp"
+            android:layout_marginTop="16dp"/>
 
         <Button
             android:id="@+id/btnHost"
-            android:layout_width="172dp"
+            android:layout_width="0dp"
             android:layout_height="74dp"
-            android:text="Start Hosting (Advertise)"
+            android:text="Add New Contact"
             app:layout_constraintBottom_toBottomOf="parent"
             app:layout_constraintEnd_toEndOf="parent"
-            app:layout_constraintHorizontal_bias="0.0"
             app:layout_constraintStart_toStartOf="parent"
-            app:layout_constraintTop_toTopOf="parent"
-            app:layout_constraintVertical_bias="0.788" />
+            app:layout_constraintVertical_bias="0.9"
+            android:layout_marginBottom="24dp"/>
 
         <Button
             android:id="@+id/btnJoin"
             android:layout_width="172dp"
             android:layout_height="74dp"
-            android:text="Join a Room (Discover)"
+            android:text="Join"
+            android:visibility="gone"
             app:layout_constraintBottom_toBottomOf="parent"
             app:layout_constraintEnd_toEndOf="parent"
-            app:layout_constraintHorizontal_bias="1.0"
-            app:layout_constraintStart_toStartOf="parent"
-            app:layout_constraintTop_toTopOf="parent"
-            app:layout_constraintVertical_bias="0.788" />
+            app:layout_constraintStart_toStartOf="parent" />
 
         <Button
             android:id="@+id/btnDisconnect"
             android:layout_width="0dp"
             android:layout_height="74dp"
-            android:backgroundTint="#ED3C3C"
-            android:text="Disconnect / Reset"
-            android:textColor="#FFFFFF"
+            android:text="Disconnect"
+            android:visibility="gone"
             app:layout_constraintBottom_toBottomOf="parent"
             app:layout_constraintEnd_toEndOf="parent"
-            app:layout_constraintHorizontal_bias="0.0"
-            app:layout_constraintStart_toStartOf="parent"
-            app:layout_constraintTop_toTopOf="parent"
-            app:layout_constraintVertical_bias="0.945" />
+            app:layout_constraintStart_toStartOf="parent" />
 
     </androidx.constraintlayout.widget.ConstraintLayout>
-
 
     <androidx.constraintlayout.widget.ConstraintLayout
         android:id="@+id/layoutChat"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:visibility="gone"
-        tools:visibility="visible">
+        tools:visibility="gone">
 
         <View
             android:id="@+id/headerBackground"
