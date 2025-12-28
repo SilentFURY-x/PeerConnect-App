@@ -12,6 +12,7 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.constraintlayout.widget.ConstraintLayout
@@ -49,11 +50,13 @@ class MainActivity : AppCompatActivity() {
 
     // Track active file transfers
     private val incomingFilePayloads = mutableMapOf<Long, Payload>()
-    private val incomingFileNames = mutableMapOf<Long, String>() // Map Payload ID to Filename
 
     // AUTO-LOOP HANDLER
     private val handler = Handler(Looper.getMainLooper())
     private val roleSwitchRunnable = Runnable { switchRoles() }
+
+    // FIX: Track the internal delayed runnable so we can cancel it too
+    private var pendingRadioSwitch: Runnable? = null
 
     // --- DATA ---
     private lateinit var db: AppDatabase
@@ -72,14 +75,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var chatRecyclerView: RecyclerView
     private lateinit var editMessage: EditText
     private lateinit var btnSend: Button
-
-    // UI: File Sharing
     private lateinit var btnAttach: Button
     private lateinit var btnExitChat: Button
 
-    // --- PERMISSIONS (FIXED FOR ANDROID 12) ---
+    // --- PERMISSIONS ---
     private val requiredPermissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-        // Android 13+ (No Storage permission needed for Downloads)
         arrayOf(
             Manifest.permission.BLUETOOTH_SCAN,
             Manifest.permission.BLUETOOTH_ADVERTISE,
@@ -88,7 +88,6 @@ class MainActivity : AppCompatActivity() {
             Manifest.permission.NEARBY_WIFI_DEVICES
         )
     } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-        // Android 10, 11, 12 (Scoped Storage - No WRITE needed for Downloads)
         arrayOf(
             Manifest.permission.BLUETOOTH_SCAN,
             Manifest.permission.BLUETOOTH_ADVERTISE,
@@ -96,7 +95,6 @@ class MainActivity : AppCompatActivity() {
             Manifest.permission.ACCESS_FINE_LOCATION
         )
     } else {
-        // Android 9 and lower (Needs WRITE_EXTERNAL_STORAGE)
         arrayOf(
             Manifest.permission.ACCESS_FINE_LOCATION,
             Manifest.permission.WRITE_EXTERNAL_STORAGE
@@ -108,15 +106,29 @@ class MainActivity : AppCompatActivity() {
     ) { permissions ->
         if (permissions.entries.all { it.value }) {
             Toast.makeText(this, "Permissions Granted!", Toast.LENGTH_SHORT).show()
-            // Only start radio AFTER permissions are granted
-            resetRadio()
-            startAutoMode()
+            // Check Location Switch, THEN start
+            checkLocationAndRun {
+                resetRadio()
+                startAutoMode()
+            }
         } else {
             Toast.makeText(this, "Permissions Denied. App won't work.", Toast.LENGTH_LONG).show()
         }
     }
 
-    // --- FILE SHARING: PICKER ---
+    // --- LOCATION ENFORCER (NEW) ---
+    private val locationResolutionLauncher = registerForActivityResult(
+        ActivityResultContracts.StartIntentSenderForResult()
+    ) { result ->
+        if (result.resultCode == RESULT_OK) {
+            Toast.makeText(this, "Location Enabled!", Toast.LENGTH_SHORT).show()
+            resetRadio()
+            startAutoMode()
+        } else {
+            updateStatus("Error: Location is Required!")
+        }
+    }
+
     private val filePickerLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -135,18 +147,15 @@ class MainActivity : AppCompatActivity() {
 
         db = AppDatabase.getDatabase(this)
 
-        // 1. Reset Status & Load History
         lifecycleScope.launch(Dispatchers.IO) {
             db.peerDao().setAllOffline()
             loadPeersFromDb()
         }
 
-        // 2. Initialize UI
         statusText = findViewById(R.id.statusText)
         chatStatusText = findViewById(R.id.chatStatusText)
         btnAddContact = findViewById(R.id.btnHost)
 
-        // Hide unused buttons
         findViewById<Button>(R.id.btnJoin).visibility = View.GONE
         findViewById<Button>(R.id.btnDisconnect).visibility = View.GONE
 
@@ -162,11 +171,8 @@ class MainActivity : AppCompatActivity() {
 
         editMessage = findViewById(R.id.editMessage)
         btnSend = findViewById(R.id.btnSend)
-
-        // CRITICAL: Ensure your XML actually has this ID
         btnAttach = findViewById(R.id.btnAttach)
 
-        // 3. SETUP ADAPTER
         peerAdapter = PeerAdapter { peer ->
             openChat(peer.name, if (peer.isOnline) peer.endpointId else null)
         }
@@ -174,15 +180,17 @@ class MainActivity : AppCompatActivity() {
 
         checkIdentity()
 
-        // 4. LISTENERS
+        // 4. LISTENERS (Updated with Location Check)
         btnAddContact.setOnClickListener {
-            if (isPairingMode) {
-                isPairingMode = false
-                btnAddContact.text = "Add New Contact"
-                btnAddContact.setBackgroundColor(android.graphics.Color.parseColor("#6200EE"))
-                startAutoMode()
-            } else {
-                showPairingDialog()
+            checkLocationAndRun {
+                if (isPairingMode) {
+                    isPairingMode = false
+                    btnAddContact.text = "Add New Contact"
+                    btnAddContact.setBackgroundColor(android.graphics.Color.parseColor("#6200EE"))
+                    startAutoMode()
+                } else {
+                    showPairingDialog()
+                }
             }
         }
 
@@ -203,27 +211,25 @@ class MainActivity : AppCompatActivity() {
 
         // 5. STARTUP LOGIC
         if (hasPermissions()) {
-            resetRadio()
-            startAutoMode()
+            checkLocationAndRun {
+                resetRadio()
+                startAutoMode()
+            }
         } else {
             permissionLauncher.launch(requiredPermissions)
         }
     }
 
     // --- NAVIGATION ---
-
     private fun openChat(peerName: String, endpointId: String?) {
         currentChatPeerName = peerName
         currentChatEndpointId = endpointId
-
         lifecycleScope.launch(Dispatchers.IO) {
             val history = db.messageDao().getChatHistory(myNickName, peerName)
             withContext(Dispatchers.Main) { updateChatUI(history) }
         }
-
         layoutConnection.visibility = View.GONE
         layoutChat.visibility = View.VISIBLE
-
         updateStatus(if (endpointId != null) "Connected" else "Offline")
         findViewById<TextView>(R.id.chatHeader).text = peerName
     }
@@ -237,39 +243,39 @@ class MainActivity : AppCompatActivity() {
     }
 
     // --- ENGINE: AUTO-CONNECT LOOP ---
-
     private fun startAutoMode() {
         handler.removeCallbacks(roleSwitchRunnable)
         switchRoles()
     }
 
     private fun switchRoles() {
-        // FIX: Stop switching if we are chatting OR if we are simply connected
         if (currentChatEndpointId != null || isConnected) return
 
-        // Stop previous role
         resetRadio()
-
         isHost = !isHost
 
-        handler.postDelayed({
-            // Only start if we are still not connected (double check)
+        // FIX: Assign to variable so we can cancel it in startManualHost
+        pendingRadioSwitch = Runnable {
             if (!isConnected) {
                 if (isHost) startAdvertising() else startDiscovery()
             }
-        }, 600)
+        }
+        handler.postDelayed(pendingRadioSwitch!!, 600)
 
         val randomDelay = (6000..10000).random().toLong()
         handler.postDelayed(roleSwitchRunnable, randomDelay)
     }
 
     private fun resetRadio() {
-        // Safe check to avoid crashes if permissions were revoked
         if (!hasPermissions()) return
         Nearby.getConnectionsClient(this).stopAdvertising()
         Nearby.getConnectionsClient(this).stopDiscovery()
         if (!isConnected) {
             Nearby.getConnectionsClient(this).stopAllEndpoints()
+        }
+        // FIX: Ensure pending start commands are cancelled
+        if (pendingRadioSwitch != null) {
+            handler.removeCallbacks(pendingRadioSwitch!!)
         }
     }
 
@@ -291,35 +297,27 @@ class MainActivity : AppCompatActivity() {
             .addOnFailureListener { e -> Log.e(TAG, "Disc fail", e) }
     }
 
-    // --- DISCONNECTION HELPER (FAIL FAST) ---
+    // --- DISCONNECTION HELPER ---
     private fun handleExplicitDisconnect(endpointId: String) {
         if (!pendingConnections.containsKey(endpointId) && currentChatEndpointId != endpointId) return
 
-        Log.e(TAG, "Handling Explicit Disconnect for $endpointId")
-
         isConnected = false
-
-        // FIX: Ensure UI updates happen on Main Thread
         runOnUiThread {
             if (endpointId == currentChatEndpointId) {
                 currentChatEndpointId = null
                 updateStatus("Offline (Connection Lost)")
             }
         }
-
         pendingConnections.remove(endpointId)
         Nearby.getConnectionsClient(this).disconnectFromEndpoint(endpointId)
-
         lifecycleScope.launch(Dispatchers.IO) {
             db.peerDao().setAllOffline()
             loadPeersFromDb()
         }
-
         startAutoMode()
     }
 
     // --- CALLBACKS ---
-
     private val endpointDiscoveryCallback = object : EndpointDiscoveryCallback() {
         override fun onEndpointFound(endpointId: String, info: DiscoveredEndpointInfo) {
             val foundName = info.endpointName
@@ -342,7 +340,6 @@ class MainActivity : AppCompatActivity() {
             val incomingName = info.endpointName
             pendingConnections[endpointId] = incomingName
             Nearby.getConnectionsClient(this@MainActivity).acceptConnection(endpointId, payloadCallback)
-
             lifecycleScope.launch(Dispatchers.IO) {
                 val isKnown = db.peerDao().isKnownPeer(incomingName)
                 if (!isKnown && !isPairingMode) {
@@ -355,11 +352,11 @@ class MainActivity : AppCompatActivity() {
 
         override fun onConnectionResult(endpointId: String, result: ConnectionResolution) {
             val peerName = pendingConnections[endpointId] ?: return
-
             if (result.status.statusCode == ConnectionsStatusCodes.STATUS_OK) {
-                // --- MARK AS CONNECTED & KILL LOOP ---
                 isConnected = true
                 handler.removeCallbacks(roleSwitchRunnable)
+                if (pendingRadioSwitch != null) handler.removeCallbacks(pendingRadioSwitch!!)
+
                 if (isPairingMode) {
                     isPairingMode = false
                     runOnUiThread {
@@ -375,7 +372,6 @@ class MainActivity : AppCompatActivity() {
 
                 lifecycleScope.launch(Dispatchers.IO) {
                     db.peerDao().insertPeer(PeerEntity(name = peerName, endpointId = endpointId, lastSeenTimestamp = System.currentTimeMillis(), isOnline = true))
-
                     withContext(Dispatchers.Main) {
                         peerAdapter.updatePeerStatus(peerName, true)
                         if (currentChatPeerName == peerName) {
@@ -383,37 +379,25 @@ class MainActivity : AppCompatActivity() {
                             updateStatus("Connected")
                         }
                     }
-
-                    // RESILIENCY
                     val pendingMsgs = db.messageDao().getUnsentMessages(peerName)
                     if (pendingMsgs.isNotEmpty()) {
                         withContext(Dispatchers.Main) { updateStatus("Sending ${pendingMsgs.size} offline messages...") }
-
                         for (msg in pendingMsgs) {
                             val encryptedText = SecurityHelper.encrypt(msg.text)
                             val chatPayload = ChatMessage(myNickName, encryptedText, msg.timestamp)
                             val payload = Payload.fromBytes(serialize(chatPayload))
-
                             pendingPayloads[payload.id] = msg.id.toLong()
-
-                            Nearby.getConnectionsClient(this@MainActivity)
-                                .sendPayload(endpointId, payload)
-                                .addOnFailureListener {
-                                    pendingPayloads.remove(payload.id)
-                                }
+                            Nearby.getConnectionsClient(this@MainActivity).sendPayload(endpointId, payload)
+                                .addOnFailureListener { pendingPayloads.remove(payload.id) }
                         }
                     }
                 }
             } else {
-                // Connection failed, resume loop
                 isConnected = false
                 startAutoMode()
             }
         }
-
-        override fun onDisconnected(endpointId: String) {
-            handleExplicitDisconnect(endpointId)
-        }
+        override fun onDisconnected(endpointId: String) { handleExplicitDisconnect(endpointId) }
     }
 
     private val payloadCallback = object : PayloadCallback() {
@@ -425,18 +409,8 @@ class MainActivity : AppCompatActivity() {
                         val msg = deserialize(receivedBytes)
                         lifecycleScope.launch(Dispatchers.IO) {
                             val decryptedBody = SecurityHelper.decrypt(msg.messageBody)
-
-                            // 1. CATCH THE FILENAME
                             if (decryptedBody.startsWith("[FILE]:")) {
                                 val cleanName = decryptedBody.removePrefix("[FILE]:")
-
-                                // We don't know the payload ID of the file yet (or maybe we do),
-                                // but usually, the file payload arrives separately.
-                                // For simplicity in this demo, we assume the next file payload
-                                // belongs to this name, or we use a timestamp fallback.
-                                // Ideally, you send a JSON with {filename, payloadId}.
-                                // For now, let's just log it and show UI.
-
                                 val displayMsg = "📄 Shared a file: $cleanName"
                                 db.messageDao().insertMessage(MessageEntity(
                                     senderId = msg.senderName, receiverId = myNickName,
@@ -448,66 +422,50 @@ class MainActivity : AppCompatActivity() {
                                     text = decryptedBody, timestamp = msg.time, isSent = true
                                 ))
                             }
-
                             if (currentChatPeerName == msg.senderName) {
                                 val history = db.messageDao().getChatHistory(myNickName, msg.senderName)
                                 withContext(Dispatchers.Main) { updateChatUI(history) }
                             }
                         }
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Deserialization failed", e)
-                    }
+                    } catch (e: Exception) { Log.e(TAG, "Deserialization failed", e) }
                 }
                 Payload.Type.FILE -> {
-                    // Track the incoming file
                     incomingFilePayloads[payload.id] = payload
-                    Log.d(TAG, "File Payload Started: ${payload.id}")
                 }
             }
         }
 
         override fun onPayloadTransferUpdate(endpointId: String, update: PayloadTransferUpdate) {
-            // Debugging: Log status to see if it even reaches here
-            if (update.status == PayloadTransferUpdate.Status.IN_PROGRESS) {
-                val progress = (100 * update.bytesTransferred / update.totalBytes).toInt()
-                if (progress % 25 == 0) Log.d(TAG, "Transfer: $progress%")
-            }
-
             if (update.status == PayloadTransferUpdate.Status.SUCCESS) {
-                // 1. Text Success
                 val dbMsgId = pendingPayloads[update.payloadId]
                 if (dbMsgId != null) {
                     lifecycleScope.launch(Dispatchers.IO) {
                         db.messageDao().markAsSent(dbMsgId.toInt())
                         pendingPayloads.remove(update.payloadId)
+                        // --- Check if queue is empty, then update Status ---
+                        if (pendingPayloads.isEmpty()) {
+                            withContext(Dispatchers.Main) {
+                                // Only update if we are still connected to this person
+                                if (currentChatEndpointId == endpointId) {
+                                    updateStatus("Connected")
+                                }
+                            }
+                        }
                     }
                 }
-
-                // 2. File Success
                 val filePayload = incomingFilePayloads[update.payloadId]
                 if (filePayload != null) {
                     incomingFilePayloads.remove(update.payloadId)
-
                     lifecycleScope.launch(Dispatchers.IO) {
                         try {
-                            // FIX: Get the ParcelFileDescriptor, NOT the Java File
                             val pfd = filePayload.asFile()?.asParcelFileDescriptor()
-
                             val fileName = "PeerConnect_${System.currentTimeMillis()}.jpg"
-
-                            // Pass the PFD to our new function
                             val success = copyToDownloads(pfd, fileName)
-
                             withContext(Dispatchers.Main) {
-                                if (success) {
-                                    Toast.makeText(this@MainActivity, "File Saved: $fileName", Toast.LENGTH_LONG).show()
-                                } else {
-                                    Toast.makeText(this@MainActivity, "Save Failed", Toast.LENGTH_SHORT).show()
-                                }
+                                if (success) Toast.makeText(this@MainActivity, "File Saved!", Toast.LENGTH_LONG).show()
+                                else Toast.makeText(this@MainActivity, "Save Failed", Toast.LENGTH_SHORT).show()
                             }
-                        } catch (e: Exception) {
-                            Log.e(TAG, "File Save Crash", e)
-                        }
+                        } catch (e: Exception) { Log.e(TAG, "File Save Crash", e) }
                     }
                 }
             }
@@ -515,13 +473,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     // --- MESSAGING ---
-
     private fun sendMessage(messageText: String) {
         val peerName = currentChatPeerName ?: return
         val endpointId = currentChatEndpointId
         val canTrySending = endpointId != null
 
         lifecycleScope.launch(Dispatchers.IO) {
+            // 1. SAVE: Persist to DB immediately (Resiliency)
             val msgEntity = MessageEntity(
                 senderId = myNickName,
                 receiverId = peerName,
@@ -531,9 +489,11 @@ class MainActivity : AppCompatActivity() {
             )
             val newMsgId = db.messageDao().insertMessage(msgEntity)
 
+            // 2. UI: Update chat screen so I see my own bubble
             val history = db.messageDao().getChatHistory(myNickName, peerName)
             withContext(Dispatchers.Main) { updateChatUI(history) }
 
+            // 3. SEND: Attempt transmission
             if (canTrySending) {
                 val encryptedText = SecurityHelper.encrypt(messageText)
                 val chatMessage = ChatMessage(myNickName, encryptedText, System.currentTimeMillis())
@@ -541,14 +501,24 @@ class MainActivity : AppCompatActivity() {
                 try {
                     val payload = Payload.fromBytes(serialize(chatMessage))
                     pendingPayloads[payload.id] = newMsgId
+
                     Nearby.getConnectionsClient(this@MainActivity)
                         .sendPayload(endpointId!!, payload)
-                        .addOnFailureListener {
+                        .addOnFailureListener { e ->
+                            // LOGIC FIX: Do NOT disconnect. Just mark as failed.
+                            Log.e(TAG, "Send Payload Failed (Transient)", e)
                             pendingPayloads.remove(payload.id)
-                            handleExplicitDisconnect(endpointId)
+
+                            launch(Dispatchers.Main) {
+                                Toast.makeText(this@MainActivity, "Message queued (Offline)", Toast.LENGTH_SHORT).show()
+                            }
                         }
                 } catch (e: Exception) {
                     Log.e(TAG, "Serialization Failed", e)
+                }
+            } else {
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(this@MainActivity, "Saved offline. Will send automatically.", Toast.LENGTH_SHORT).show()
                 }
             }
         }
@@ -556,6 +526,25 @@ class MainActivity : AppCompatActivity() {
     }
 
     // --- HELPERS ---
+    private fun checkLocationAndRun(action: () -> Unit) {
+        val locationRequest = com.google.android.gms.location.LocationRequest.Builder(
+            com.google.android.gms.location.Priority.PRIORITY_BALANCED_POWER_ACCURACY, 1000
+        ).build()
+        val builder = com.google.android.gms.location.LocationSettingsRequest.Builder()
+            .addLocationRequest(locationRequest)
+        val client = com.google.android.gms.location.LocationServices.getSettingsClient(this)
+
+        client.checkLocationSettings(builder.build())
+            .addOnSuccessListener { action() }
+            .addOnFailureListener { exception ->
+                if (exception is com.google.android.gms.common.api.ResolvableApiException) {
+                    try {
+                        val request = IntentSenderRequest.Builder(exception.resolution).build()
+                        locationResolutionLauncher.launch(request)
+                    } catch (e: Exception) { }
+                }
+            }
+    }
 
     private fun showPairingDialog() {
         val options = arrayOf("Receive (Host)", "Send (Join)")
@@ -573,28 +562,66 @@ class MainActivity : AppCompatActivity() {
 
     private fun startManualHost() {
         handler.removeCallbacks(roleSwitchRunnable)
-        resetRadio()
+        if (pendingRadioSwitch != null) handler.removeCallbacks(pendingRadioSwitch!!) // FIX GHOST RUNNABLE
+
+        // HARD RESET
+        Nearby.getConnectionsClient(this).stopAdvertising()
+        Nearby.getConnectionsClient(this).stopDiscovery()
+        Nearby.getConnectionsClient(this).stopAllEndpoints()
+
+        isConnected = false
         isPairingMode = true
         isHost = true
-        updateStatus("Pairing: Hosting (Visible)...")
-        btnAddContact.text = "Hosting... (Tap to Cancel)"
-        btnAddContact.setBackgroundColor(android.graphics.Color.RED)
 
-        val options = AdvertisingOptions.Builder().setStrategy(STRATEGY).setLowPower(false).build()
-        Nearby.getConnectionsClient(this).startAdvertising(myNickName, SERVICE_ID, connectionLifecycleCallback, options)
+        updateStatus("Initializing Radio...")
+        btnAddContact.text = "Please Wait..."
+        btnAddContact.setBackgroundColor(android.graphics.Color.DKGRAY)
+
+        handler.postDelayed({
+            updateStatus("Pairing: Hosting (Visible)...")
+            btnAddContact.text = "Hosting... (Tap to Cancel)"
+            btnAddContact.setBackgroundColor(android.graphics.Color.RED)
+            val options = AdvertisingOptions.Builder().setStrategy(STRATEGY).setLowPower(false).build()
+            Nearby.getConnectionsClient(this)
+                .startAdvertising(myNickName, SERVICE_ID, connectionLifecycleCallback, options)
+                .addOnFailureListener { e ->
+                    Log.e(TAG, "Manual Host Failed", e)
+                    updateStatus("Error: Radio Failed. Retry.")
+                    btnAddContact.text = "Retry"
+                }
+        }, 1000)
     }
 
     private fun startManualJoin() {
         handler.removeCallbacks(roleSwitchRunnable)
-        resetRadio()
+        if (pendingRadioSwitch != null) handler.removeCallbacks(pendingRadioSwitch!!) // FIX GHOST RUNNABLE
+
+        // HARD RESET
+        Nearby.getConnectionsClient(this).stopAdvertising()
+        Nearby.getConnectionsClient(this).stopDiscovery()
+        Nearby.getConnectionsClient(this).stopAllEndpoints()
+
+        isConnected = false
         isPairingMode = true
         isHost = false
-        updateStatus("Pairing: Scanning...")
-        btnAddContact.text = "Scanning... (Tap to Cancel)"
-        btnAddContact.setBackgroundColor(android.graphics.Color.BLUE)
 
-        val options = DiscoveryOptions.Builder().setStrategy(STRATEGY).build()
-        Nearby.getConnectionsClient(this).startDiscovery(SERVICE_ID, endpointDiscoveryCallback, options)
+        updateStatus("Initializing Radio...")
+        btnAddContact.text = "Please Wait..."
+        btnAddContact.setBackgroundColor(android.graphics.Color.DKGRAY)
+
+        handler.postDelayed({
+            updateStatus("Pairing: Scanning...")
+            btnAddContact.text = "Scanning... (Tap to Cancel)"
+            btnAddContact.setBackgroundColor(android.graphics.Color.BLUE)
+            val options = DiscoveryOptions.Builder().setStrategy(STRATEGY).build()
+            Nearby.getConnectionsClient(this)
+                .startDiscovery(SERVICE_ID, endpointDiscoveryCallback, options)
+                .addOnFailureListener { e ->
+                    Log.e(TAG, "Manual Join Failed", e)
+                    updateStatus("Error: Radio Failed. Retry.")
+                    btnAddContact.text = "Retry"
+                }
+        }, 1000)
     }
 
     private fun updateStatus(text: String) {
@@ -673,7 +700,6 @@ class MainActivity : AppCompatActivity() {
         return requiredPermissions.all { ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }
     }
 
-    // Helper to extract filename from URI
     private fun getFileNameFromUri(uri: android.net.Uri): String? {
         var name: String? = null
         val cursor = contentResolver.query(uri, null, null, null, null)
@@ -688,15 +714,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun sendFile(uri: android.net.Uri, fileName: String) {
         if (currentChatEndpointId == null) return
-
         try {
             val pfd = contentResolver.openFileDescriptor(uri, "r") ?: return
             val filePayload = Payload.fromFile(pfd)
             Nearby.getConnectionsClient(this).sendPayload(currentChatEndpointId!!, filePayload)
-
             val metaText = "[FILE]:$fileName"
             sendMessage(metaText)
-
             Toast.makeText(this, "Sending $fileName...", Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
             Log.e(TAG, "File Error", e)
@@ -705,47 +728,29 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun copyToDownloads(inputPFD: android.os.ParcelFileDescriptor?, fileName: String): Boolean {
-        if (inputPFD == null) {
-            Log.e(TAG, "Save Failed: Input PFD is null")
-            return false
-        }
-
+        if (inputPFD == null) return false
         return try {
-            // Create an input stream directly from the system descriptor
-            // This bypasses the "Permission Denied" file path check
             val inputStream = android.os.ParcelFileDescriptor.AutoCloseInputStream(inputPFD)
-
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                // --- ANDROID 10+ (MediaStore) ---
                 val contentValues = android.content.ContentValues().apply {
                     put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, fileName)
                     put(android.provider.MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
                     put(android.provider.MediaStore.MediaColumns.IS_PENDING, 1)
                 }
-
                 val resolver = contentResolver
                 val uri = resolver.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, contentValues)
                     ?: throw java.io.IOException("MediaStore insertion failed")
-
                 resolver.openOutputStream(uri).use { output ->
                     if (output == null) throw java.io.IOException("Output stream is null")
-                    inputStream.use { input ->
-                        input.copyTo(output)
-                    }
+                    inputStream.use { input -> input.copyTo(output) }
                 }
-
                 contentValues.clear()
                 contentValues.put(android.provider.MediaStore.MediaColumns.IS_PENDING, 0)
                 resolver.update(uri, contentValues, null, null)
-
-                Log.d(TAG, "File saved to MediaStore: $uri")
                 true
-
             } else {
-                // --- ANDROID 9 & OLDER ---
                 val downloadsDir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS)
                 if (!downloadsDir.exists()) downloadsDir.mkdirs()
-
                 var finalFile = java.io.File(downloadsDir, fileName)
                 var counter = 1
                 while (finalFile.exists()) {
@@ -754,13 +759,7 @@ class MainActivity : AppCompatActivity() {
                     finalFile = java.io.File(downloadsDir, "$nameWithoutExt($counter).$ext")
                     counter++
                 }
-
-                java.io.FileOutputStream(finalFile).use { output ->
-                    inputStream.use { input ->
-                        input.copyTo(output)
-                    }
-                }
-                Log.d(TAG, "File saved to Legacy Path: ${finalFile.absolutePath}")
+                java.io.FileOutputStream(finalFile).use { output -> inputStream.use { input -> input.copyTo(output) } }
                 true
             }
         } catch (e: Exception) {
