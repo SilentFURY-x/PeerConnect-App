@@ -37,6 +37,8 @@ class MainActivity : AppCompatActivity() {
     private var isHost = false
     private var myNickName: String = ""
 
+    private var isConnected = false
+
     // CHAT STATE
     private var currentChatPeerName: String? = null
     private var currentChatEndpointId: String? = null
@@ -242,7 +244,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun switchRoles() {
-        if (currentChatEndpointId != null) return
+        // FIX: Stop switching if we are chatting OR if we are simply connected
+        if (currentChatEndpointId != null || isConnected) return
 
         // Stop previous role
         resetRadio()
@@ -250,7 +253,10 @@ class MainActivity : AppCompatActivity() {
         isHost = !isHost
 
         handler.postDelayed({
-            if (isHost) startAdvertising() else startDiscovery()
+            // Only start if we are still not connected (double check)
+            if (!isConnected) {
+                if (isHost) startAdvertising() else startDiscovery()
+            }
         }, 600)
 
         val randomDelay = (6000..10000).random().toLong()
@@ -262,7 +268,9 @@ class MainActivity : AppCompatActivity() {
         if (!hasPermissions()) return
         Nearby.getConnectionsClient(this).stopAdvertising()
         Nearby.getConnectionsClient(this).stopDiscovery()
-        Nearby.getConnectionsClient(this).stopAllEndpoints()
+        if (!isConnected) {
+            Nearby.getConnectionsClient(this).stopAllEndpoints()
+        }
     }
 
     private fun startAdvertising() {
@@ -288,6 +296,8 @@ class MainActivity : AppCompatActivity() {
         if (!pendingConnections.containsKey(endpointId) && currentChatEndpointId != endpointId) return
 
         Log.e(TAG, "Handling Explicit Disconnect for $endpointId")
+
+        isConnected = false
 
         // FIX: Ensure UI updates happen on Main Thread
         runOnUiThread {
@@ -347,6 +357,9 @@ class MainActivity : AppCompatActivity() {
             val peerName = pendingConnections[endpointId] ?: return
 
             if (result.status.statusCode == ConnectionsStatusCodes.STATUS_OK) {
+                // --- MARK AS CONNECTED & KILL LOOP ---
+                isConnected = true
+                handler.removeCallbacks(roleSwitchRunnable)
                 if (isPairingMode) {
                     isPairingMode = false
                     runOnUiThread {
@@ -392,6 +405,8 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
             } else {
+                // Connection failed, resume loop
+                isConnected = false
                 startAutoMode()
             }
         }
