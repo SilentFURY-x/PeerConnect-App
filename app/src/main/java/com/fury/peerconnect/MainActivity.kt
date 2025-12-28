@@ -323,8 +323,12 @@ class MainActivity : AppCompatActivity() {
                     val pendingMsgs = db.messageDao().getUnsentMessages(peerName)
                     if (pendingMsgs.isNotEmpty()) {
                         withContext(Dispatchers.Main) { updateStatus("Sending ${pendingMsgs.size} offline messages...") }
+
                         for (msg in pendingMsgs) {
-                            val chatPayload = ChatMessage(myNickName, msg.text, msg.timestamp)
+                            // --- FIX: Encrypt plaintext from DB before sending ---
+                            val encryptedText = SecurityHelper.encrypt(msg.text)
+
+                            val chatPayload = ChatMessage(myNickName, encryptedText, msg.timestamp)
                             val payload = Payload.fromBytes(serialize(chatPayload))
 
                             // Map pending payload
@@ -354,10 +358,20 @@ class MainActivity : AppCompatActivity() {
             if (payload.type == Payload.Type.BYTES) {
                 val receivedBytes = payload.asBytes()!!
                 val msg = deserialize(receivedBytes)
+
                 lifecycleScope.launch(Dispatchers.IO) {
+                    // --- NEW CODE: DECRYPTION ---
+                    val decryptedBody = SecurityHelper.decrypt(msg.messageBody)
+                    // ----------------------------
+
                     db.messageDao().insertMessage(MessageEntity(
-                        senderId = msg.senderName, receiverId = myNickName, text = msg.messageBody, timestamp = msg.time, isSent = true
+                        senderId = msg.senderName,
+                        receiverId = myNickName,
+                        text = decryptedBody, // <--- Store Decrypted text
+                        timestamp = msg.time,
+                        isSent = true
                     ))
+
                     if (currentChatPeerName == msg.senderName) {
                         val history = db.messageDao().getChatHistory(myNickName, msg.senderName)
                         withContext(Dispatchers.Main) { updateChatUI(history) }
@@ -388,8 +402,14 @@ class MainActivity : AppCompatActivity() {
 
         lifecycleScope.launch(Dispatchers.IO) {
             // 1. SAVE AS PENDING
+            // IMPORTANT: Save the ORIGINAL 'messageText' to your DB,
+            // otherwise you won't be able to read what you just wrote.
             val msgEntity = MessageEntity(
-                senderId = myNickName, receiverId = peerName, text = messageText, timestamp = System.currentTimeMillis(), isSent = false
+                senderId = myNickName,
+                receiverId = peerName,
+                text = messageText, // <--- Store Plaintext locally
+                timestamp = System.currentTimeMillis(),
+                isSent = false
             )
             val newMsgId = db.messageDao().insertMessage(msgEntity)
 
@@ -399,7 +419,14 @@ class MainActivity : AppCompatActivity() {
 
             // 3. TRY SEND
             if (canTrySending) {
-                val chatMessage = ChatMessage(myNickName, messageText, System.currentTimeMillis())
+                // --- NEW CODE: ENCRYPTION ---
+                // Encrypt the text before putting it into the ChatMessage object
+                val encryptedText = SecurityHelper.encrypt(messageText)
+
+                // We send 'encryptedText' over the air
+                val chatMessage = ChatMessage(myNickName, encryptedText, System.currentTimeMillis())
+                // ----------------------------
+
                 val payload = Payload.fromBytes(serialize(chatMessage))
 
                 pendingPayloads[payload.id] = newMsgId
@@ -410,8 +437,6 @@ class MainActivity : AppCompatActivity() {
                         // FAIL FAST
                         Log.e(TAG, "Send Failed. Disconnecting.")
                         pendingPayloads.remove(payload.id)
-
-                        // FIX: Called directly (No withContext needed here)
                         handleExplicitDisconnect(endpointId)
                     }
             }
