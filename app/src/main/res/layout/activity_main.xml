@@ -12,7 +12,7 @@
         android:layout_height="match_parent"
         android:padding="24dp"
         android:visibility="visible"
-        tools:visibility="visible">
+        tools:visibility="gone">
 
         <TextView
             android:id="@+id/statusText"
@@ -32,25 +32,25 @@
             android:id="@+id/peersRecyclerView"
             android:layout_width="0dp"
             android:layout_height="0dp"
+            android:layout_marginTop="16dp"
+            android:layout_marginBottom="16dp"
             app:layout_constraintBottom_toTopOf="@+id/btnHost"
             app:layout_constraintEnd_toEndOf="parent"
             app:layout_constraintHorizontal_bias="1.0"
             app:layout_constraintStart_toStartOf="parent"
             app:layout_constraintTop_toBottomOf="@+id/statusText"
-            app:layout_constraintVertical_bias="0.0"
-            android:layout_marginBottom="16dp"
-            android:layout_marginTop="16dp"/>
+            app:layout_constraintVertical_bias="0.0" />
 
         <Button
             android:id="@+id/btnHost"
             android:layout_width="0dp"
             android:layout_height="74dp"
+            android:layout_marginBottom="24dp"
             android:text="Add New Contact"
             app:layout_constraintBottom_toBottomOf="parent"
             app:layout_constraintEnd_toEndOf="parent"
             app:layout_constraintStart_toStartOf="parent"
-            app:layout_constraintVertical_bias="0.9"
-            android:layout_marginBottom="24dp"/>
+            app:layout_constraintVertical_bias="0.9" />
 
         <Button
             android:id="@+id/btnJoin"
@@ -79,7 +79,7 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:visibility="gone"
-        tools:visibility="gone">
+        tools:visibility="visible">
 
         <View
             android:id="@+id/headerBackground"
@@ -124,9 +124,9 @@
             android:textAlignment="center"
             android:textColor="#FFFFFF"
             android:textSize="12sp"
-            app:layout_constraintTop_toBottomOf="@+id/headerBackground"
+            app:layout_constraintEnd_toEndOf="parent"
             app:layout_constraintStart_toStartOf="parent"
-            app:layout_constraintEnd_toEndOf="parent" />
+            app:layout_constraintTop_toBottomOf="@+id/headerBackground" />
 
         <androidx.recyclerview.widget.RecyclerView
             android:id="@+id/chatRecyclerView"
@@ -138,11 +138,27 @@
             app:layout_constraintStart_toStartOf="parent"
             app:layout_constraintTop_toBottomOf="@+id/chatStatusText" />
 
+        <Button
+            android:id="@+id/btnAttach"
+            android:layout_width="50dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="12dp"
+            android:layout_marginBottom="12dp"
+            android:insetLeft="0dp"
+            android:insetRight="0dp"
+            android:minWidth="0dp"
+            android:padding="0dp"
+            android:text="+"
+            android:textSize="24sp"
+            app:layout_constraintBottom_toBottomOf="parent"
+            app:layout_constraintEnd_toStartOf="@+id/editMessage"
+            app:layout_constraintStart_toStartOf="parent" />
+
         <EditText
             android:id="@+id/editMessage"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:layout_marginStart="12dp"
+            android:layout_marginStart="8dp"
             android:layout_marginEnd="8dp"
             android:layout_marginBottom="12dp"
             android:background="@android:drawable/edit_text"
@@ -152,7 +168,7 @@
             android:textColor="@color/black"
             app:layout_constraintBottom_toBottomOf="parent"
             app:layout_constraintEnd_toStartOf="@id/btnSend"
-            app:layout_constraintStart_toStartOf="parent" />
+            app:layout_constraintStart_toEndOf="@id/btnAttach" />
 
         <Button
             android:id="@+id/btnSend"
