@@ -44,6 +44,10 @@ class MainActivity : AppCompatActivity() {
     private var currentChatPeerName: String? = null
     private var currentChatEndpointId: String? = null
 
+    // Track discovered devices for manual selection
+    private val discoveredEndpoints = mutableMapOf<String, String>()
+    private var selectionDialog: androidx.appcompat.app.AlertDialog? = null
+
     // TRACKING
     private val pendingConnections = mutableMapOf<String, String>()
     private val pendingPayloads = mutableMapOf<Long, Long>()
@@ -155,9 +159,6 @@ class MainActivity : AppCompatActivity() {
         statusText = findViewById(R.id.statusText)
         chatStatusText = findViewById(R.id.chatStatusText)
         btnAddContact = findViewById(R.id.btnHost)
-
-        findViewById<Button>(R.id.btnJoin).visibility = View.GONE
-        findViewById<Button>(R.id.btnDisconnect).visibility = View.GONE
 
         layoutConnection = findViewById(R.id.layoutConnection)
         layoutChat = findViewById(R.id.layoutChat)
@@ -321,18 +322,38 @@ class MainActivity : AppCompatActivity() {
     private val endpointDiscoveryCallback = object : EndpointDiscoveryCallback() {
         override fun onEndpointFound(endpointId: String, info: DiscoveredEndpointInfo) {
             val foundName = info.endpointName
+
             lifecycleScope.launch(Dispatchers.IO) {
+                // Check if we already know this person
                 val isKnown = db.peerDao().isKnownPeer(foundName)
+
                 withContext(Dispatchers.Main) {
-                    if (isKnown || isPairingMode) {
+                    if (isKnown) {
+                        // SCENARIO 1: Known Friend (Auto-Connect)
+                        // This preserves your existing logic for friends
                         Nearby.getConnectionsClient(this@MainActivity)
                             .requestConnection(myNickName, endpointId, connectionLifecycleCallback)
                         handler.removeCallbacks(roleSwitchRunnable)
                     }
+                    else if (isPairingMode) {
+                        // SCENARIO 2: Unknown Device & User clicked "Add Contact" (Manual Selection)
+                        // Do NOT request connection yet.
+                        // Add to list and update the UI.
+                        if (!discoveredEndpoints.containsKey(endpointId)) {
+                            discoveredEndpoints[endpointId] = foundName
+                            showDeviceSelectionDialog()
+                        }
+                    }
                 }
             }
         }
-        override fun onEndpointLost(endpointId: String) {}
+        override fun onEndpointLost(endpointId: String) {
+            // Optional: Remove from list if they go out of range
+            if (isPairingMode) {
+                discoveredEndpoints.remove(endpointId)
+                showDeviceSelectionDialog()
+            }
+        }
     }
 
     private val connectionLifecycleCallback = object : ConnectionLifecycleCallback() {
@@ -594,7 +615,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun startManualJoin() {
         handler.removeCallbacks(roleSwitchRunnable)
-        if (pendingRadioSwitch != null) handler.removeCallbacks(pendingRadioSwitch!!) // FIX GHOST RUNNABLE
+        if (pendingRadioSwitch != null) handler.removeCallbacks(pendingRadioSwitch!!)
 
         // HARD RESET
         Nearby.getConnectionsClient(this).stopAdvertising()
@@ -605,6 +626,9 @@ class MainActivity : AppCompatActivity() {
         isPairingMode = true
         isHost = false
 
+        // NEW: Clear previous scan results
+        discoveredEndpoints.clear()
+
         updateStatus("Initializing Radio...")
         btnAddContact.text = "Please Wait..."
         btnAddContact.setBackgroundColor(android.graphics.Color.DKGRAY)
@@ -614,6 +638,8 @@ class MainActivity : AppCompatActivity() {
             btnAddContact.text = "Scanning... (Tap to Cancel)"
             btnAddContact.setBackgroundColor(android.graphics.Color.BLUE)
             val options = DiscoveryOptions.Builder().setStrategy(STRATEGY).build()
+
+            // Note: endpointDiscoveryCallback is modified below
             Nearby.getConnectionsClient(this)
                 .startDiscovery(SERVICE_ID, endpointDiscoveryCallback, options)
                 .addOnFailureListener { e ->
@@ -766,5 +792,50 @@ class MainActivity : AppCompatActivity() {
             Log.e(TAG, "CRITICAL SAVE ERROR: ${e.message}", e)
             return false
         }
+    }
+
+    private fun showDeviceSelectionDialog() {
+        // If map is empty, dismiss dialog if it's showing
+        if (discoveredEndpoints.isEmpty()) {
+            selectionDialog?.dismiss()
+            return
+        }
+
+        // Prepare data for the list
+        val endpointIds = discoveredEndpoints.keys.toList()
+        val names = discoveredEndpoints.values.toTypedArray()
+
+        // Create or Update the Dialog
+        // Note: Recreating the builder is the simplest way to refresh the list dynamically
+        if (selectionDialog != null && selectionDialog!!.isShowing) {
+            selectionDialog!!.dismiss()
+        }
+
+        val builder = androidx.appcompat.app.AlertDialog.Builder(this)
+        builder.setTitle("Found Devices")
+        builder.setItems(names) { _, which ->
+            // USER SELECTED A DEVICE
+            val selectedEndpointId = endpointIds[which]
+            val selectedName = names[which]
+
+            Toast.makeText(this, "Connecting to $selectedName...", Toast.LENGTH_SHORT).show()
+
+            // Initiate the connection now
+            Nearby.getConnectionsClient(this)
+                .requestConnection(myNickName, selectedEndpointId, connectionLifecycleCallback)
+
+            // Stop scanning to prevent interference
+            Nearby.getConnectionsClient(this).stopDiscovery()
+            handler.removeCallbacks(roleSwitchRunnable)
+        }
+
+        builder.setNegativeButton("Cancel") { dialog, _ ->
+            dialog.dismiss()
+            // Optional: Stop scanning if user cancels
+            startAutoMode()
+        }
+
+        selectionDialog = builder.create()
+        selectionDialog!!.show()
     }
 }
