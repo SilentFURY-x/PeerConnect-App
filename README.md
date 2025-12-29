@@ -13,6 +13,11 @@ It is designed for high-interference environments, subways, airplanes, or remote
 
 ---
 
+## 📥 Download
+[Download the latest APK here](https://github.com/SilentFURY-x/PeerConnect-App/releases)
+
+---
+
 ## 🌟 Key Features
 
 ### 📡 Connectivity & Discovery
