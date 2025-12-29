@@ -65,6 +65,3 @@ Unlike standard Bluetooth, Nearby Connections requires one device to be an Adver
 * [ ] **Mesh Networking:** Allow Device A to talk to Device C via Device B.
 * [ ] **Voice Calls:** WebRTC implementation over the offline socket.
 
-## 📜 License
-
-Distributed under the MIT License.
