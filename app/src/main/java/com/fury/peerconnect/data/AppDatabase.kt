@@ -1,9 +1,10 @@
-package com.fury.peerconnect
+package com.fury.peerconnect.data
 
 import android.content.Context
 import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
+import com.fury.peerconnect.ui.MessageEntity
 
 // version is now 2, and MessageEntity is added to entities array
 @Database(entities = [PeerEntity::class, MessageEntity::class], version = 2)

@@ -1,4 +1,4 @@
-package com.fury.peerconnect
+package com.fury.peerconnect.data
 
 import java.io.Serializable
 data class ChatMessage(

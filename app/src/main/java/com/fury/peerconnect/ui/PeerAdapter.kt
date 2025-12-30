@@ -1,4 +1,4 @@
-package com.fury.peerconnect
+package com.fury.peerconnect.ui
 
 import android.graphics.Color
 import android.view.LayoutInflater
@@ -6,6 +6,8 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.TextView
 import androidx.recyclerview.widget.RecyclerView
+import com.fury.peerconnect.R
+import com.fury.peerconnect.data.PeerEntity
 
 class PeerAdapter(private val onPeerClicked: (PeerEntity) -> Unit) :
     RecyclerView.Adapter<PeerAdapter.PeerViewHolder>() {

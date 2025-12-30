@@ -1,4 +1,4 @@
-package com.fury.peerconnect
+package com.fury.peerconnect.logic
 
 import android.util.Base64
 import javax.crypto.Cipher

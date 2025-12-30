@@ -1,11 +1,19 @@
-package com.fury.peerconnect
+package com.fury.peerconnect.ui
 
 import android.Manifest
+import android.content.ContentValues
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Color
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelFileDescriptor
+import android.provider.MediaStore
+import android.provider.OpenableColumns
 import android.util.Log
 import android.view.View
 import android.widget.Button
@@ -14,17 +22,36 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.constraintlayout.widget.ConstraintLayout
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
+import com.fury.peerconnect.R
+import com.fury.peerconnect.logic.SecurityHelper
+import com.fury.peerconnect.logic.UserManager
+import com.fury.peerconnect.data.AppDatabase
+import com.fury.peerconnect.data.ChatMessage
+import com.fury.peerconnect.data.PeerEntity
+import com.google.android.gms.common.api.ResolvableApiException
+import com.google.android.gms.location.LocationRequest
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.LocationSettingsRequest
+import com.google.android.gms.location.Priority
 import com.google.android.gms.nearby.Nearby
 import com.google.android.gms.nearby.connection.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.launch
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
+import java.io.ObjectInputStream
+import java.io.ObjectOutputStream
 
 class MainActivity : AppCompatActivity() {
 
@@ -46,7 +73,7 @@ class MainActivity : AppCompatActivity() {
 
     // Track discovered devices for manual selection
     private val discoveredEndpoints = mutableMapOf<String, String>()
-    private var selectionDialog: androidx.appcompat.app.AlertDialog? = null
+    private var selectionDialog: AlertDialog? = null
 
     // TRACKING
     private val pendingConnections = mutableMapOf<String, String>()
@@ -187,7 +214,7 @@ class MainActivity : AppCompatActivity() {
                 if (isPairingMode) {
                     isPairingMode = false
                     btnAddContact.text = "Add New Contact"
-                    btnAddContact.setBackgroundColor(android.graphics.Color.parseColor("#6200EE"))
+                    btnAddContact.setBackgroundColor(Color.parseColor("#6200EE"))
                     startAutoMode()
                 } else {
                     showPairingDialog()
@@ -201,14 +228,16 @@ class MainActivity : AppCompatActivity() {
         }
 
         btnAttach.setOnClickListener {
-            val intent = android.content.Intent(android.content.Intent.ACTION_OPEN_DOCUMENT).apply {
-                addCategory(android.content.Intent.CATEGORY_OPENABLE)
+            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
                 type = "*/*"
             }
             filePickerLauncher.launch(intent)
         }
 
         btnExitChat.setOnClickListener { closeChat() }
+
+        Nearby.getConnectionsClient(this).stopAllEndpoints()
 
         // 5. STARTUP LOGIC
         if (hasPermissions()) {
@@ -300,21 +329,44 @@ class MainActivity : AppCompatActivity() {
 
     // --- DISCONNECTION HELPER ---
     private fun handleExplicitDisconnect(endpointId: String) {
+        // 1. Check if this disconnect is relevant to us
         if (!pendingConnections.containsKey(endpointId) && currentChatEndpointId != endpointId) return
 
         isConnected = false
+
+        // 2. UI Cleanup on Main Thread
         runOnUiThread {
             if (endpointId == currentChatEndpointId) {
                 currentChatEndpointId = null
                 updateStatus("Offline (Connection Lost)")
             }
         }
+
+        // 3. Remove connection references
         pendingConnections.remove(endpointId)
         Nearby.getConnectionsClient(this).disconnectFromEndpoint(endpointId)
+
+        // 4. DATABASE FIX: Update ONLY the disconnected peer
         lifecycleScope.launch(Dispatchers.IO) {
-            db.peerDao().setAllOffline()
+            // A. Get all peers
+            val allPeers = db.peerDao().getAllPeers()
+
+            // B. Find the specific peer who owns this endpointId
+            val disconnectedPeer = allPeers.find { it.endpointId == endpointId }
+
+            // C. Mark ONLY them as offline and save
+            if (disconnectedPeer != null) {
+                db.peerDao().insertPeer(disconnectedPeer.copy(isOnline = false))
+            } else {
+                // Fallback: If we couldn't match the ID, just ensure data consistency
+                // (Optional) db.peerDao().setAllOffline()
+            }
+
+            // D. Refresh UI
             loadPeersFromDb()
         }
+
+        // 5. Restart scanning/advertising
         startAutoMode()
     }
 
@@ -373,47 +425,76 @@ class MainActivity : AppCompatActivity() {
 
         override fun onConnectionResult(endpointId: String, result: ConnectionResolution) {
             val peerName = pendingConnections[endpointId] ?: return
+
             if (result.status.statusCode == ConnectionsStatusCodes.STATUS_OK) {
                 isConnected = true
                 handler.removeCallbacks(roleSwitchRunnable)
                 if (pendingRadioSwitch != null) handler.removeCallbacks(pendingRadioSwitch!!)
 
+                // 1. Reset UI if we were in pairing mode
                 if (isPairingMode) {
                     isPairingMode = false
                     runOnUiThread {
                         btnAddContact.text = "Add New Contact"
                         btnAddContact.setBackgroundColor(android.graphics.Color.parseColor("#6200EE"))
                     }
-                    lifecycleScope.launch(Dispatchers.IO) {
-                        db.peerDao().insertPeer(PeerEntity(name = peerName, endpointId = endpointId, lastSeenTimestamp = System.currentTimeMillis(), isOnline = true))
-                        loadPeersFromDb()
-                    }
-                    startAutoMode()
                 }
 
+                // 2. CRITICAL FIX: Database & UI Sync
                 lifecycleScope.launch(Dispatchers.IO) {
-                    db.peerDao().insertPeer(PeerEntity(name = peerName, endpointId = endpointId, lastSeenTimestamp = System.currentTimeMillis(), isOnline = true))
+                    // A. Update DB with the NEW Endpoint ID (This overwrites the old dead ID)
+                    db.peerDao().insertPeer(
+                        PeerEntity(
+                            name = peerName,
+                            endpointId = endpointId, // <--- The fresh ID
+                            lastSeenTimestamp = System.currentTimeMillis(),
+                            isOnline = true
+                        )
+                    )
+
+                    // B. RELOAD THE FULL LIST from DB to get that fresh ID
+                    val updatedPeers = db.peerDao().getAllPeers()
+
                     withContext(Dispatchers.Main) {
-                        peerAdapter.updatePeerStatus(peerName, true)
+                        // C. Update Adapter with the WHOLE list (Fixes the "One-Way" bug)
+                        if (::peerAdapter.isInitialized) {
+                            peerAdapter.updateList(updatedPeers)
+                        }
+
+                        // D. If chat is already open, update the variable immediately
                         if (currentChatPeerName == peerName) {
                             currentChatEndpointId = endpointId
                             updateStatus("Connected")
                         }
                     }
+
+                    // 3. Handle Offline Messages
                     val pendingMsgs = db.messageDao().getUnsentMessages(peerName)
                     if (pendingMsgs.isNotEmpty()) {
                         withContext(Dispatchers.Main) { updateStatus("Sending ${pendingMsgs.size} offline messages...") }
                         for (msg in pendingMsgs) {
                             val encryptedText = SecurityHelper.encrypt(msg.text)
                             val chatPayload = ChatMessage(myNickName, encryptedText, msg.timestamp)
-                            val payload = Payload.fromBytes(serialize(chatPayload))
-                            pendingPayloads[payload.id] = msg.id.toLong()
-                            Nearby.getConnectionsClient(this@MainActivity).sendPayload(endpointId, payload)
-                                .addOnFailureListener { pendingPayloads.remove(payload.id) }
+
+                            try {
+                                val payload = Payload.fromBytes(serialize(chatPayload))
+                                pendingPayloads[payload.id] = msg.id.toLong()
+                                Nearby.getConnectionsClient(this@MainActivity).sendPayload(endpointId, payload)
+                                    .addOnFailureListener { pendingPayloads.remove(payload.id) }
+                            } catch (e: Exception) {
+                                Log.e(TAG, "Offline Msg Fail", e)
+                            }
                         }
                     }
                 }
+
+                // 4. Restart the auto-loop (if not chatting)
+                if (currentChatPeerName == null) {
+                    startAutoMode()
+                }
+
             } else {
+                // Connection Rejected/Failed
                 isConnected = false
                 startAutoMode()
             }
@@ -548,17 +629,17 @@ class MainActivity : AppCompatActivity() {
 
     // --- HELPERS ---
     private fun checkLocationAndRun(action: () -> Unit) {
-        val locationRequest = com.google.android.gms.location.LocationRequest.Builder(
-            com.google.android.gms.location.Priority.PRIORITY_BALANCED_POWER_ACCURACY, 1000
+        val locationRequest = LocationRequest.Builder(
+            Priority.PRIORITY_BALANCED_POWER_ACCURACY, 1000
         ).build()
-        val builder = com.google.android.gms.location.LocationSettingsRequest.Builder()
+        val builder = LocationSettingsRequest.Builder()
             .addLocationRequest(locationRequest)
-        val client = com.google.android.gms.location.LocationServices.getSettingsClient(this)
+        val client = LocationServices.getSettingsClient(this)
 
         client.checkLocationSettings(builder.build())
             .addOnSuccessListener { action() }
             .addOnFailureListener { exception ->
-                if (exception is com.google.android.gms.common.api.ResolvableApiException) {
+                if (exception is ResolvableApiException) {
                     try {
                         val request = IntentSenderRequest.Builder(exception.resolution).build()
                         locationResolutionLauncher.launch(request)
@@ -569,7 +650,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun showPairingDialog() {
         val options = arrayOf("Receive (Host)", "Send (Join)")
-        val builder = androidx.appcompat.app.AlertDialog.Builder(this)
+        val builder = AlertDialog.Builder(this)
         builder.setTitle("Pairing Mode")
         builder.setItems(options) { _, which ->
             if (which == 0) startManualHost() else startManualJoin()
@@ -596,12 +677,12 @@ class MainActivity : AppCompatActivity() {
 
         updateStatus("Initializing Radio...")
         btnAddContact.text = "Please Wait..."
-        btnAddContact.setBackgroundColor(android.graphics.Color.DKGRAY)
+        btnAddContact.setBackgroundColor(Color.DKGRAY)
 
         handler.postDelayed({
             updateStatus("Pairing: Hosting (Visible)...")
             btnAddContact.text = "Hosting... (Tap to Cancel)"
-            btnAddContact.setBackgroundColor(android.graphics.Color.RED)
+            btnAddContact.setBackgroundColor(Color.RED)
             val options = AdvertisingOptions.Builder().setStrategy(STRATEGY).setLowPower(false).build()
             Nearby.getConnectionsClient(this)
                 .startAdvertising(myNickName, SERVICE_ID, connectionLifecycleCallback, options)
@@ -631,12 +712,12 @@ class MainActivity : AppCompatActivity() {
 
         updateStatus("Initializing Radio...")
         btnAddContact.text = "Please Wait..."
-        btnAddContact.setBackgroundColor(android.graphics.Color.DKGRAY)
+        btnAddContact.setBackgroundColor(Color.DKGRAY)
 
         handler.postDelayed({
             updateStatus("Pairing: Scanning...")
             btnAddContact.text = "Scanning... (Tap to Cancel)"
-            btnAddContact.setBackgroundColor(android.graphics.Color.BLUE)
+            btnAddContact.setBackgroundColor(Color.BLUE)
             val options = DiscoveryOptions.Builder().setStrategy(STRATEGY).build()
 
             // Note: endpointDiscoveryCallback is modified below
@@ -654,17 +735,21 @@ class MainActivity : AppCompatActivity() {
         statusText.text = text
         chatStatusText.text = text
         if (text.contains("Offline") || text.contains("Waiting") || text.contains("Scanning")) {
-            chatStatusText.setBackgroundColor(android.graphics.Color.RED)
+            chatStatusText.setBackgroundColor(Color.RED)
         } else if (text.contains("Connected")) {
-            chatStatusText.setBackgroundColor(android.graphics.Color.parseColor("#4CAF50"))
+            chatStatusText.setBackgroundColor(Color.parseColor("#4CAF50"))
         } else {
-            chatStatusText.setBackgroundColor(android.graphics.Color.parseColor("#333333"))
+            chatStatusText.setBackgroundColor(Color.parseColor("#333333"))
         }
     }
 
     private fun updateChatUI(history: List<MessageEntity>) {
         val chatMessages = history.map { entity ->
-            ChatMessage(senderName = entity.senderId, messageBody = entity.text, time = entity.timestamp)
+            ChatMessage(
+                senderName = entity.senderId,
+                messageBody = entity.text,
+                time = entity.timestamp
+            )
         }
         chatAdapter.setMessages(chatMessages)
         if (chatAdapter.itemCount > 0) chatRecyclerView.scrollToPosition(chatAdapter.itemCount - 1)
@@ -685,7 +770,7 @@ class MainActivity : AppCompatActivity() {
     private fun showNameInputDialog() {
         val input = EditText(this)
         input.hint = "Enter your unique ID/Name"
-        val dialog = androidx.appcompat.app.AlertDialog.Builder(this)
+        val dialog = AlertDialog.Builder(this)
             .setTitle("Welcome")
             .setView(input).setCancelable(false)
             .setPositiveButton("Save") { _, _ ->
@@ -710,15 +795,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun serialize(message: ChatMessage): ByteArray {
-        val outputStream = java.io.ByteArrayOutputStream()
-        val objectStream = java.io.ObjectOutputStream(outputStream)
+        val outputStream = ByteArrayOutputStream()
+        val objectStream = ObjectOutputStream(outputStream)
         objectStream.writeObject(message)
         return outputStream.toByteArray()
     }
 
     private fun deserialize(bytes: ByteArray): ChatMessage {
-        val inputStream = java.io.ByteArrayInputStream(bytes)
-        val objectStream = java.io.ObjectInputStream(inputStream)
+        val inputStream = ByteArrayInputStream(bytes)
+        val objectStream = ObjectInputStream(inputStream)
         return objectStream.readObject() as ChatMessage
     }
 
@@ -726,19 +811,19 @@ class MainActivity : AppCompatActivity() {
         return requiredPermissions.all { ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED }
     }
 
-    private fun getFileNameFromUri(uri: android.net.Uri): String? {
+    private fun getFileNameFromUri(uri: Uri): String? {
         var name: String? = null
         val cursor = contentResolver.query(uri, null, null, null, null)
         cursor?.use {
             if (it.moveToFirst()) {
-                val index = it.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                val index = it.getColumnIndex(OpenableColumns.DISPLAY_NAME)
                 if (index != -1) name = it.getString(index)
             }
         }
         return name
     }
 
-    private fun sendFile(uri: android.net.Uri, fileName: String) {
+    private fun sendFile(uri: Uri, fileName: String) {
         if (currentChatEndpointId == null) return
         try {
             val pfd = contentResolver.openFileDescriptor(uri, "r") ?: return
@@ -753,39 +838,39 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun copyToDownloads(inputPFD: android.os.ParcelFileDescriptor?, fileName: String): Boolean {
+    private fun copyToDownloads(inputPFD: ParcelFileDescriptor?, fileName: String): Boolean {
         if (inputPFD == null) return false
         return try {
-            val inputStream = android.os.ParcelFileDescriptor.AutoCloseInputStream(inputPFD)
+            val inputStream = ParcelFileDescriptor.AutoCloseInputStream(inputPFD)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val contentValues = android.content.ContentValues().apply {
-                    put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-                    put(android.provider.MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
-                    put(android.provider.MediaStore.MediaColumns.IS_PENDING, 1)
+                val contentValues = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                    put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+                    put(MediaStore.MediaColumns.IS_PENDING, 1)
                 }
                 val resolver = contentResolver
-                val uri = resolver.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, contentValues)
-                    ?: throw java.io.IOException("MediaStore insertion failed")
+                val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, contentValues)
+                    ?: throw IOException("MediaStore insertion failed")
                 resolver.openOutputStream(uri).use { output ->
-                    if (output == null) throw java.io.IOException("Output stream is null")
+                    if (output == null) throw IOException("Output stream is null")
                     inputStream.use { input -> input.copyTo(output) }
                 }
                 contentValues.clear()
-                contentValues.put(android.provider.MediaStore.MediaColumns.IS_PENDING, 0)
+                contentValues.put(MediaStore.MediaColumns.IS_PENDING, 0)
                 resolver.update(uri, contentValues, null, null)
                 true
             } else {
-                val downloadsDir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS)
+                val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
                 if (!downloadsDir.exists()) downloadsDir.mkdirs()
-                var finalFile = java.io.File(downloadsDir, fileName)
+                var finalFile = File(downloadsDir, fileName)
                 var counter = 1
                 while (finalFile.exists()) {
                     val nameWithoutExt = fileName.substringBeforeLast(".")
                     val ext = fileName.substringAfterLast(".", "")
-                    finalFile = java.io.File(downloadsDir, "$nameWithoutExt($counter).$ext")
+                    finalFile = File(downloadsDir, "$nameWithoutExt($counter).$ext")
                     counter++
                 }
-                java.io.FileOutputStream(finalFile).use { output -> inputStream.use { input -> input.copyTo(output) } }
+                FileOutputStream(finalFile).use { output -> inputStream.use { input -> input.copyTo(output) } }
                 true
             }
         } catch (e: Exception) {
@@ -811,7 +896,7 @@ class MainActivity : AppCompatActivity() {
             selectionDialog!!.dismiss()
         }
 
-        val builder = androidx.appcompat.app.AlertDialog.Builder(this)
+        val builder = AlertDialog.Builder(this)
         builder.setTitle("Found Devices")
         builder.setItems(names) { _, which ->
             // USER SELECTED A DEVICE

@@ -1,4 +1,4 @@
-package com.fury.peerconnect
+package com.fury.peerconnect.data
 
 import androidx.room.Entity
 import androidx.room.PrimaryKey

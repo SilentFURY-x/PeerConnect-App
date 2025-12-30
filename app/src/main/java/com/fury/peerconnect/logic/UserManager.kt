@@ -1,4 +1,4 @@
-package com.fury.peerconnect
+package com.fury.peerconnect.logic
 
 import android.content.Context
 import android.content.SharedPreferences
