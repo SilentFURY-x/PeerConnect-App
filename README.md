@@ -138,6 +138,18 @@ Distributed under the MIT License. See `LICENSE` for more information.
 
 ---
 
+## 👨‍💻 Author
+<div align="center">
+
+**Arjun Tyagi**
+
+[![GitHub](https://img.shields.io/badge/github-%23121011.svg?style=for-the-badge&logo=github&logoColor=white)](https://github.com/SilentFURY-x)
+[![LinkedIn](https://img.shields.io/badge/linkedin-%230077B5.svg?style=for-the-badge&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/arjun-tyagi-84b1b5328/)
+
+</div>
+
+---
+
 <p align="center">
   Built with ❤️ by <b>Arjun Tyagi</b>
 </p>
