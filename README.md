@@ -1,9 +1,13 @@
+<div align="center">
+   
 # PeerConnect 📱🔗
 
 ![Kotlin](https://img.shields.io/badge/Kotlin-1.9.0-purple?style=for-the-badge&logo=kotlin)
 ![Platform](https://img.shields.io/badge/Platform-Android-green?style=for-the-badge&logo=android)
 ![API](https://img.shields.io/badge/API-Google_Nearby_Connections-blue?style=for-the-badge&logo=google)
 ![Status](https://img.shields.io/badge/Status-Active_Development-orange?style=for-the-badge)
+
+</div>
 
 > **Serverless. Private. Resilient.**
 
