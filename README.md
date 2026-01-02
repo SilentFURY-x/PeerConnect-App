@@ -74,7 +74,7 @@ When adding a new contact, the app suspends the auto-loop and enters **Pairing M
 
 1.  **Clone the repository:**
     ```bash
-    git clone [https://github.com/SilentFURY-x/PeerConnect.git](https://github.com/SilentFURY-x/PeerConnect.git)
+    git clone https://github.com/SilentFURY-x/PeerConnect-App.git
     ```
 2.  **Open in Android Studio:**
     Ensure you are using the latest version (Hedgehog or newer).
