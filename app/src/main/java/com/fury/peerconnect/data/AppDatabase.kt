@@ -10,7 +10,7 @@ import com.fury.peerconnect.ui.MessageEntity
 @Database(entities = [PeerEntity::class, MessageEntity::class], version = 2)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun peerDao(): PeerDao
-    abstract fun messageDao(): MessageDao // ADD THIS LINE
+    abstract fun messageDao(): MessageDao
 
     companion object {
         @Volatile
